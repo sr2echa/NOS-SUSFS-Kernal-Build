@@ -3,6 +3,9 @@ name: Build Nothing OS 4.1 Kernel (SUSFS)
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build-kernel:
     runs-on: ubuntu-latest
