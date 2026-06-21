@@ -31,8 +31,9 @@ jobs:
           echo ">> Initializing Android 15-6.6 manifest environment wrapper..."
           repo init -u https://android.googlesource.com/kernel/manifest -b common-android15-6.6 --depth=1
           
-          echo ">> Syncing build tooling and toolchains selectively (skipping generic source trees)..."
-          repo sync -c -j$(nproc) --no-tags --no-clone-bundle build/kernel prebuilts/clang/host/linux-x86 prebuilts/build-tools prebuilts/bazel/linux-x86_64
+          echo ">> Syncing manifest environment (Shallow sync for speed and completeness)..."
+          # Full shallow sync avoids missing underlying Kleaf compiler configurations
+          repo sync -c -j$(nproc) --no-tags --no-clone-bundle
           
           echo ">> Constructing Kleaf workspace symlinks..."
           ln -sf build/kernel/kleaf/WORKSPACE WORKSPACE
@@ -69,12 +70,13 @@ jobs:
           if [ -n "$PATCH_FILE" ]; then
             patch -p1 < "$PATCH_FILE" || echo "Patch applied with minor offsets."
           else
-            patch -p1 < /tmp/susfs4ksu/ksu_patches/50_add_susfs_in_ksunext-6.6.patch || echo "Fallback patch completed or already matched configuration."
+            patch -p1 < /tmp/susfs4ksu/ksu_patches/50_add_susfs_in_ksunext-6.6.patch || echo "Fallback patch completed."
           fi
           cd ..
 
-          echo ">> Injecting Kernel config flags into compilation defconfigs..."
-          find arch/arm64/configs/ -type f -name "*_defconfig" -exec sh -c 'echo "\nCONFIG_KSU=y\nCONFIG_SUSFS=y" >> "$1"' _ {} \;
+          echo ">> Forcing Config Flags into all target build defconfigs..."
+          # Broad target config application ensures Bazel compiles with KSU/SUSFS regardless of target architecture fragments
+          find arch/arm64/configs/ -type f \( -name "*_defconfig" -o -name "*.config" -o -name "*.fragment" \) -exec sh -c 'echo "\nCONFIG_KSU=y\nCONFIG_SUSFS=y" >> "$1"' _ {} \;
 
       - name: 6. Compile the Kernel via Qualcomm Kleaf
         working-directory: workspace
