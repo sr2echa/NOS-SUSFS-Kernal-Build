@@ -1,0 +1,61 @@
+name: Build Nothing OS 4.1 Kernel (SUSFS)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. Maximize Build Space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 8192
+          swap-size-mb: 8192
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+
+      - name: 2. Checkout Nothing Kernel Source (NOS 4.1)
+        uses: actions/checkout@v4
+        with:
+          repository: NothingOSS/android_kernel_msm-6.6_nothing_sm8735
+          ref: sm8735/b/mr
+          path: kernel_workspace
+
+      - name: 3. Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc curl git python3 python-is-python3 libssl-dev repo flex bison zip unzip
+
+      - name: 4. Inject KernelSU-Next & SUSFS
+        working-directory: kernel_workspace
+        run: |
+          echo ">> Downloading KernelSU-Next..."
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
+
+          echo ">> Downloading SUSFS Patches..."
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 /tmp/susfs4ksu
+
+          echo ">> Applying SUSFS to Kernel Source..."
+          cp -r /tmp/susfs4ksu/kernel_patches/fs/* fs/
+          cp -r /tmp/susfs4ksu/kernel_patches/include/linux/* include/linux/
+          echo "obj-y += susfs.o" >> fs/Makefile
+
+          echo ">> Patching KernelSU-Next for SUSFS..."
+          cd KernelSU-Next
+          patch -p1 < /tmp/susfs4ksu/ksu_patches/50_add_susfs_in_ksunext-6.6.patch || echo "Patch already matched configuration."
+          cd ..
+
+      - name: 5. Compile the Kernel
+        working-directory: kernel_workspace
+        run: |
+          echo ">> Starting Kernel Compilation via Qualcomm Bazel..."
+          tools/bazel run //msm-kernel:kernel_aarch64_dist -- --dist_dir=out_dist
+
+      - name: 6. Upload Boot Image
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-img-nos4.1-susfs
+          path: kernel_workspace/out_dist/boot.img
+          compression-level: 9
