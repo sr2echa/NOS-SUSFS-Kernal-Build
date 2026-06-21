@@ -29,10 +29,10 @@ jobs:
           mkdir -p workspace
           cd workspace
           echo ">> Initializing Android 15-6.6 manifest environment wrapper..."
-          repo init -u https://android.googlesource.com/kernel/manifest -b common-android15-6.6
+          repo init -u https://android.googlesource.com/kernel/manifest -b common-android15-6.6 --depth=1
           
           echo ">> Syncing build tooling and toolchains selectively (skipping generic source trees)..."
-          repo sync -c -j$(nproc) --no-tags --no-clone-bundle --depth=1 build/kernel prebuilts/clang/host/linux-x86 prebuilts/build-tools prebuilts/bazel/linux-x86_64
+          repo sync -c -j$(nproc) --no-tags --no-clone-bundle build/kernel prebuilts/clang/host/linux-x86 prebuilts/build-tools prebuilts/bazel/linux-x86_64
           
           echo ">> Constructing Kleaf workspace symlinks..."
           ln -sf build/kernel/kleaf/WORKSPACE WORKSPACE
