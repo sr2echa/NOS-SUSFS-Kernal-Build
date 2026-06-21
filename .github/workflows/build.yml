@@ -31,12 +31,15 @@ jobs:
           echo ">> Initializing Android 15-6.6 manifest environment wrapper..."
           repo init -u https://android.googlesource.com/kernel/manifest -b common-android15-6.6 --depth=1
           
-          echo ">> Syncing manifest environment (Shallow sync for speed and completeness)..."
-          # Full shallow sync avoids missing underlying Kleaf compiler configurations
+          echo ">> Syncing manifest environment..."
           repo sync -c -j$(nproc) --no-tags --no-clone-bundle
           
-          echo ">> Constructing Kleaf workspace symlinks..."
-          ln -sf build/kernel/kleaf/WORKSPACE WORKSPACE
+          echo ">> Constructing Kleaf workspace configuration..."
+          # Copy the workspace template instead of symlinking so we can append private OEM overrides
+          cp build/kernel/kleaf/WORKSPACE WORKSPACE
+          chmod +w WORKSPACE
+          echo 'local_repository(name = "nt_project", path = "nt_project")' >> WORKSPACE
+          
           mkdir -p tools
           ln -sf ../build/kernel/kleaf/bazel.sh tools/bazel
 
@@ -75,8 +78,59 @@ jobs:
           cd ..
 
           echo ">> Forcing Config Flags into all target build defconfigs..."
-          # Broad target config application ensures Bazel compiles with KSU/SUSFS regardless of target architecture fragments
           find arch/arm64/configs/ -type f \( -name "*_defconfig" -o -name "*.config" -o -name "*.fragment" \) -exec sh -c 'echo "\nCONFIG_KSU=y\nCONFIG_SUSFS=y" >> "$1"' _ {} \;
+
+      - name: 5.5 Auto-Mock Nothing OS Private Dependencies
+        working-directory: workspace
+        run: |
+          echo ">> Mapping out hidden OEM Bazel components..."
+          cat << 'EOF' > mock_nt.py
+          import os
+          import re
+
+          os.makedirs("nt_project", exist_ok=True)
+          with open("nt_project/BUILD.bazel", "w") as f:
+              f.write("")
+
+          symbols = {}
+          
+          # Recursively scan all Bazel architecture rules in the kernel to locate variables pulled from @nt_project
+          for root, dirs, files in os.walk("msm-kernel"):
+              for file in files:
+                  if file.endswith(".bzl") or file in ["BUILD", "BUILD.bazel"]:
+                      fn = os.path.join(root, file)
+                      try:
+                          with open(fn, "r", encoding="utf-8", errors="ignore") as f:
+                              content = f.read()
+                          if "nt_project" in content:
+                              print(f"[*] Found private OEM hook inside: {fn}")
+                              
+                              # Extract variable names being requested
+                              matches = re.findall(r"load\s*\(\s*[\"\']@nt_project//:dict\.bzl[\"\']\s*,\s*([^)]+)\)", content)
+                              for match in matches:
+                                  for part in match.split(","):
+                                      part = part.strip()
+                                      if not part: continue
+                                      if "=" in part:
+                                          sym = part.split("=")[1].strip().strip("\"").strip("'")
+                                      else:
+                                          sym = part.strip("\"").strip("'")
+                                      if sym:
+                                          # Automatically guess expected data-type constraint (Lists vs Dicts)
+                                          if "module" in sym.lower() or "out" in sym.lower() or "+" in content:
+                                              symbols[sym] = "[]"
+                                          else:
+                                              # Fallback dict maps core targets such as Metroid (Phone 3 / sm8735 platform configuration)
+                                              symbols[sym] = '{"metroid": {}, "sun": {}, "pacman": {}, "pong": {}, "spock": {}, "default": {}}'
+                      except Exception:
+                          pass
+
+          print(f">> Successfully isolated symbols to fulfill: {list(symbols.keys())}")
+          with open("nt_project/dict.bzl", "w") as f:
+              for sym, val in symbols.items():
+                  f.write(f"{sym} = {val}\n")
+          EOF
+          python3 mock_nt.py
 
       - name: 6. Compile the Kernel via Qualcomm Kleaf
         working-directory: workspace
