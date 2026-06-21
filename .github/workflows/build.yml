@@ -28,9 +28,9 @@ jobs:
         run: |
           mkdir -p workspace
           cd workspace
-          echo ">> Initializing Android 16-6.6 manifest environment wrapper..."
-          # Aligned precisely to Android 16 repository tooling branches
-          repo init -u https://android.googlesource.com/kernel/manifest -b common-android16-6.6 --depth=1
+          echo ">> Initializing Android 6.6 Kernel Manifest wrapper..."
+          # Google maintains the 6.6 GKI compilation tree on common-android15-6.6, which handles Android 16 upgrades
+          repo init -u https://android.googlesource.com/kernel/manifest -b common-android15-6.6 --depth=1
           
           echo ">> Syncing manifest environment..."
           repo sync -c -j$(nproc) --no-tags --no-clone-bundle
@@ -48,7 +48,7 @@ jobs:
             TARGET_MOD="build/kernel/kleaf/bzlmod/bazel.MODULE.bazel"
           fi
 
-          # Unlink underlying read-only references before writing configurations
+          # Clear out automated read-only hardlinks/symlinks to allow customization
           rm -f WORKSPACE MODULE.bazel
           
           echo ">> Writing customized independent Workspace parameters..."
@@ -56,7 +56,7 @@ jobs:
           chmod +w WORKSPACE
           echo 'local_repository(name = "nt_project", path = "nt_project")' >> WORKSPACE
 
-          # Maintain integration strings across Bazel-Bzlmod environments
+          # Inject mock parameters for compatibility across modern Bazel/Bzlmod layers
           if [ -n "$TARGET_MOD" ]; then
             cp "$TARGET_MOD" MODULE.bazel
             chmod +w MODULE.bazel
@@ -81,7 +81,6 @@ jobs:
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
 
           echo ">> Downloading SUSFS Patches..."
-          # Keeps gki-android15-6.6 patch set as it maps perfectly to the baseline 6.6 kernel architecture layout
           git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 /tmp/susfs4ksu
 
           echo ">> Applying SUSFS to Kernel Source..."
