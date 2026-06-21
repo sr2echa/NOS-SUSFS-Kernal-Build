@@ -28,32 +28,41 @@ jobs:
         run: |
           mkdir -p workspace
           cd workspace
-          echo ">> Initializing Android 15-6.6 manifest environment wrapper..."
-          repo init -u https://android.googlesource.com/kernel/manifest -b common-android15-6.6 --depth=1
+          echo ">> Initializing Android 16-6.6 manifest environment wrapper..."
+          # Aligned precisely to Android 16 repository tooling branches
+          repo init -u https://android.googlesource.com/kernel/manifest -b common-android16-6.6 --depth=1
           
           echo ">> Syncing manifest environment..."
           repo sync -c -j$(nproc) --no-tags --no-clone-bundle
           
           echo ">> Constructing Kleaf workspace configuration..."
-          # Handle Android 15's new bazel.WORKSPACE structure gracefully
           if [ -f build/kernel/kleaf/bazel.WORKSPACE ]; then
-            cp build/kernel/kleaf/bazel.WORKSPACE WORKSPACE
+            TARGET_WS="build/kernel/kleaf/bazel.WORKSPACE"
           elif [ -f build/kernel/kleaf/WORKSPACE ]; then
-            cp build/kernel/kleaf/WORKSPACE WORKSPACE
+            TARGET_WS="build/kernel/kleaf/WORKSPACE"
           else
             echo ">> [FATAL] Kleaf Workspace template not found!" && exit 1
           fi
           
-          # Symlink modern Bzlmod definitions if Android 15 platform layer demands them
           if [ -f build/kernel/kleaf/bzlmod/bazel.MODULE.bazel ]; then
-            ln -sf build/kernel/kleaf/bzlmod/bazel.MODULE.bazel MODULE.bazel
-          fi
-          if [ -f build/kernel/kleaf/bzlmod/bazel.WORKSPACE.bzlmod ]; then
-            ln -sf build/kernel/kleaf/bzlmod/bazel.WORKSPACE.bzlmod WORKSPACE.bzlmod
+            TARGET_MOD="build/kernel/kleaf/bzlmod/bazel.MODULE.bazel"
           fi
 
+          # Unlink underlying read-only references before writing configurations
+          rm -f WORKSPACE MODULE.bazel
+          
+          echo ">> Writing customized independent Workspace parameters..."
+          cp "$TARGET_WS" WORKSPACE
           chmod +w WORKSPACE
           echo 'local_repository(name = "nt_project", path = "nt_project")' >> WORKSPACE
+
+          # Maintain integration strings across Bazel-Bzlmod environments
+          if [ -n "$TARGET_MOD" ]; then
+            cp "$TARGET_MOD" MODULE.bazel
+            chmod +w MODULE.bazel
+            echo 'bazel_dep(name = "nt_project")' >> MODULE.bazel
+            echo 'local_path_override(module_name = "nt_project", path = "nt_project")' >> MODULE.bazel
+          fi
           
           mkdir -p tools
           ln -sf ../build/kernel/kleaf/bazel.sh tools/bazel
@@ -72,6 +81,7 @@ jobs:
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
 
           echo ">> Downloading SUSFS Patches..."
+          # Keeps gki-android15-6.6 patch set as it maps perfectly to the baseline 6.6 kernel architecture layout
           git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 /tmp/susfs4ksu
 
           echo ">> Applying SUSFS to Kernel Source..."
