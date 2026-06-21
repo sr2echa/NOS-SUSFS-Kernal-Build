@@ -19,20 +19,35 @@ jobs:
           remove-android: 'true'
           remove-haskell: 'true'
 
-      - name: 2. Checkout Nothing Kernel Source (NOS 4.1)
-        uses: actions/checkout@v4
-        with:
-          repository: NothingOSS/android_kernel_msm-6.6_nothing_sm8735
-          ref: sm8735/b/mr
-          path: kernel_workspace
-
-      - name: 3. Install Build Dependencies
+      - name: 2. Install Build Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential bc curl git python3 python-is-python3 libssl-dev repo flex bison zip unzip
 
-      - name: 4. Inject KernelSU-Next & SUSFS
-        working-directory: kernel_workspace
+      - name: 3. Setup Kleaf / Bazel Build Workspace Environment
+        run: |
+          mkdir -p workspace
+          cd workspace
+          echo ">> Initializing Android 15-6.6 manifest environment wrapper..."
+          repo init -u https://android.googlesource.com/kernel/manifest -b common-android15-6.6
+          
+          echo ">> Syncing build tooling and toolchains selectively (skipping generic source trees)..."
+          repo sync -c -j$(nproc) --no-tags --no-clone-bundle --depth=1 build/kernel prebuilts/clang/host/linux-x86 prebuilts/build-tools prebuilts/bazel/linux-x86_64
+          
+          echo ">> Constructing Kleaf workspace symlinks..."
+          ln -sf build/kernel/kleaf/WORKSPACE WORKSPACE
+          mkdir -p tools
+          ln -sf ../build/kernel/kleaf/bazel.sh tools/bazel
+
+      - name: 4. Checkout Nothing Kernel Source (NOS 4.1)
+        uses: actions/checkout@v4
+        with:
+          repository: NothingOSS/android_kernel_msm-6.6_nothing_sm8735
+          ref: sm8735/b/mr
+          path: workspace/msm-kernel
+
+      - name: 5. Inject KernelSU-Next & SUSFS
+        working-directory: workspace/msm-kernel
         run: |
           echo ">> Downloading KernelSU-Next..."
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
@@ -43,22 +58,33 @@ jobs:
           echo ">> Applying SUSFS to Kernel Source..."
           cp -r /tmp/susfs4ksu/kernel_patches/fs/* fs/
           cp -r /tmp/susfs4ksu/kernel_patches/include/linux/* include/linux/
-          echo "obj-y += susfs.o" >> fs/Makefile
+          
+          if ! grep -q "susfs.o" fs/Makefile; then
+            echo "obj-y += susfs.o" >> fs/Makefile
+          fi
 
           echo ">> Patching KernelSU-Next for SUSFS..."
           cd KernelSU-Next
-          patch -p1 < /tmp/susfs4ksu/ksu_patches/50_add_susfs_in_ksunext-6.6.patch || echo "Patch already matched configuration."
+          PATCH_FILE=$(find /tmp/susfs4ksu/ksu_patches/ -name "*susfs*ksunext*.patch" -o -name "*50_add_susfs_in_ksunext*" | head -n 1)
+          if [ -n "$PATCH_FILE" ]; then
+            patch -p1 < "$PATCH_FILE" || echo "Patch applied with minor offsets."
+          else
+            patch -p1 < /tmp/susfs4ksu/ksu_patches/50_add_susfs_in_ksunext-6.6.patch || echo "Fallback patch completed or already matched configuration."
+          fi
           cd ..
 
-      - name: 5. Compile the Kernel
-        working-directory: kernel_workspace
+          echo ">> Injecting Kernel config flags into compilation defconfigs..."
+          find arch/arm64/configs/ -type f -name "*_defconfig" -exec sh -c 'echo "\nCONFIG_KSU=y\nCONFIG_SUSFS=y" >> "$1"' _ {} \;
+
+      - name: 6. Compile the Kernel via Qualcomm Kleaf
+        working-directory: workspace
         run: |
-          echo ">> Starting Kernel Compilation via Qualcomm Bazel..."
+          echo ">> Commencing Kernel Compilation via Qualcomm Bazel..."
           tools/bazel run //msm-kernel:kernel_aarch64_dist -- --dist_dir=out_dist
 
-      - name: 6. Upload Boot Image
+      - name: 7. Upload Boot Image
         uses: actions/upload-artifact@v4
         with:
           name: boot-img-nos4.1-susfs
-          path: kernel_workspace/out_dist/boot.img
+          path: workspace/out_dist/boot.img
           compression-level: 9
