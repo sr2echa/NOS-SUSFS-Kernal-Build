@@ -47,7 +47,7 @@ jobs:
             TARGET_MOD="build/kernel/kleaf/bzlmod/bazel.MODULE.bazel"
           fi
 
-          # Clear automated read-only targets
+          # Clear out automated read-only structures
           rm -f WORKSPACE MODULE.bazel
           
           echo ">> Writing customized independent Workspace parameters..."
@@ -112,12 +112,9 @@ jobs:
           echo ">> Mapping out Qualcomm build configuration extensions..."
           if [ -f msm-kernel/msm_kernel_extensions.bzl ]; then
             cp msm-kernel/msm_kernel_extensions.bzl build/
-            echo "Successfully mapped msm_kernel_extensions.bzl from msm-kernel root."
           elif [ -f msm-kernel/build/msm_kernel_extensions.bzl ]; then
             cp msm-kernel/build/msm_kernel_extensions.bzl build/
-            echo "Successfully mapped msm_kernel_extensions.bzl from msm-kernel/build."
           else
-            echo ">> msm_kernel_extensions.bzl not found in tree, generating programmatic fallback architecture stub..."
             cat << 'EOF' > build/msm_kernel_extensions.bzl
           def define_top_level_rules(): pass
           def define_extras(*args, **kwargs): pass
@@ -131,16 +128,42 @@ jobs:
           EOF
           fi
 
-          echo ">> Mapping out hidden OEM Bazel components..."
-          cat << 'EOF' > mock_nt.py
+          echo ">> Sanitizing obsolete toolchain parameters and mocking OEM layers..."
+          cat << 'EOF' > sanitize_and_mock.py
           import os
           import re
 
+          def remove_attribute(content, attr_name):
+              pattern = r'\b' + attr_name + r'\s*=\s*'
+              while True:
+                  match = re.search(pattern, content)
+                  if not match:
+                      break
+                  start_idx = match.start()
+                  end_idx = match.end()
+                  bracket_count = 0
+                  paren_count = 0
+                  brace_count = 0
+                  while end_idx < len(content):
+                      char = content[end_idx]
+                      if char == '(': paren_count += 1
+                      elif char == ')': paren_count -= 1
+                      elif char == '[': bracket_count += 1
+                      elif char == ']': bracket_count -= 1
+                      elif char == '{': brace_count += 1
+                      elif char == '}': brace_count -= 1
+                      elif char == ',' and bracket_count == 0 and paren_count == 0 and brace_count == 0:
+                          end_idx += 1
+                          break
+                      elif char == '\n' and bracket_count == 0 and paren_count == 0 and brace_count == 0:
+                          break
+                      end_idx += 1
+                  content = content[:start_idx] + content[end_idx:]
+              return content
+
           os.makedirs("nt_project", exist_ok=True)
-          with open("nt_project/BUILD.bazel", "w") as f:
-              f.write("")
-          with open("nt_project/MODULE.bazel", "w") as f:
-              f.write('module(name = "nt_project")\n')
+          with open("nt_project/BUILD.bazel", "w") as f: f.write("")
+          with open("nt_project/MODULE.bazel", "w") as f: f.write('module(name = "nt_project")\n')
 
           symbols = {}
           
@@ -151,8 +174,15 @@ jobs:
                       try:
                           with open(fn, "r", encoding="utf-8", errors="ignore") as f:
                               content = f.read()
+                          
+                          # Sanitize deprecated parameters to prevent rule failures
+                          if "gki_ramdisk_prebuilt_binary" in content:
+                              print(f"[*] Scrubbing invalid attribute 'gki_ramdisk_prebuilt_binary' from: {fn}")
+                              content = remove_attribute(content, "gki_ramdisk_prebuilt_binary")
+                              with open(fn, "w", encoding="utf-8") as f:
+                                  f.write(content)
+
                           if "nt_project" in content:
-                              print(f"[*] Found private OEM hook inside: {fn}")
                               matches = re.findall(r"load\s*\(\s*[\"\']@nt_project//:dict\.bzl[\"\']\s*,\s*([^)]+)\)", content)
                               for match in matches:
                                   for part in match.split(","):
@@ -167,15 +197,14 @@ jobs:
                                               symbols[sym] = "[]"
                                           else:
                                               symbols[sym] = '{"metroid": {}, "sun": {}, "pacman": {}, "pong": {}, "spock": {}, "default": {}}'
-                      except Exception:
-                          pass
+                      except Exception as e:
+                          print(f"[!] Error processing {fn}: {e}")
 
-          print(f">> Successfully isolated symbols to fulfill: {list(symbols.keys())}")
           with open("nt_project/dict.bzl", "w") as f:
               for sym, val in symbols.items():
                   f.write(f"{sym} = {val}\n")
           EOF
-          python3 mock_nt.py
+          python3 sanitize_and_mock.py
 
       - name: 6. Compile the Kernel via Qualcomm Kleaf
         working-directory: workspace
