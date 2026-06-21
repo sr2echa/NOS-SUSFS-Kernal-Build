@@ -29,7 +29,6 @@ jobs:
           mkdir -p workspace
           cd workspace
           echo ">> Initializing Android 6.6 Kernel Manifest wrapper..."
-          # Google maintains the 6.6 GKI compilation tree on common-android15-6.6, which handles Android 16 upgrades
           repo init -u https://android.googlesource.com/kernel/manifest -b common-android15-6.6 --depth=1
           
           echo ">> Syncing manifest environment..."
@@ -48,7 +47,7 @@ jobs:
             TARGET_MOD="build/kernel/kleaf/bzlmod/bazel.MODULE.bazel"
           fi
 
-          # Clear out automated read-only hardlinks/symlinks to allow customization
+          # Clear automated read-only targets
           rm -f WORKSPACE MODULE.bazel
           
           echo ">> Writing customized independent Workspace parameters..."
@@ -56,7 +55,6 @@ jobs:
           chmod +w WORKSPACE
           echo 'local_repository(name = "nt_project", path = "nt_project")' >> WORKSPACE
 
-          # Inject mock parameters for compatibility across modern Bazel/Bzlmod layers
           if [ -n "$TARGET_MOD" ]; then
             cp "$TARGET_MOD" MODULE.bazel
             chmod +w MODULE.bazel
@@ -104,9 +102,35 @@ jobs:
           echo ">> Forcing Config Flags into all target build defconfigs..."
           find arch/arm64/configs/ -type f \( -name "*_defconfig" -o -name "*.config" -o -name "*.fragment" \) -exec sh -c 'echo "\nCONFIG_KSU=y\nCONFIG_SUSFS=y" >> "$1"' _ {} \;
 
-      - name: 5.5 Auto-Mock Nothing OS Private Dependencies
+      - name: 5.5 Fix Qualcomm Build Package & Auto-Mock Dependencies
         working-directory: workspace
         run: |
+          echo ">> Initializing root build package layout..."
+          mkdir -p build
+          touch build/BUILD.bazel
+
+          echo ">> Mapping out Qualcomm build configuration extensions..."
+          if [ -f msm-kernel/msm_kernel_extensions.bzl ]; then
+            cp msm-kernel/msm_kernel_extensions.bzl build/
+            echo "Successfully mapped msm_kernel_extensions.bzl from msm-kernel root."
+          elif [ -f msm-kernel/build/msm_kernel_extensions.bzl ]; then
+            cp msm-kernel/build/msm_kernel_extensions.bzl build/
+            echo "Successfully mapped msm_kernel_extensions.bzl from msm-kernel/build."
+          else
+            echo ">> msm_kernel_extensions.bzl not found in tree, generating programmatic fallback architecture stub..."
+            cat << 'EOF' > build/msm_kernel_extensions.bzl
+          def define_top_level_rules(): pass
+          def define_extras(*args, **kwargs): pass
+          def get_build_config_fragments(*args, **kwargs): return []
+          def get_dtb_list(*args, **kwargs): return []
+          def get_dtbo_list(*args, **kwargs): return []
+          def get_dtstree(*args, **kwargs): return ""
+          def get_gki_ramdisk_prebuilt_binary(*args, **kwargs): return ""
+          def get_vendor_ramdisk_binaries(*args, **kwargs): return []
+          def define_combined_vm_image(*args, **kwargs): pass
+          EOF
+          fi
+
           echo ">> Mapping out hidden OEM Bazel components..."
           cat << 'EOF' > mock_nt.py
           import os
