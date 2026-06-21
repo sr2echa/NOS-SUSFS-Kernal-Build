@@ -35,8 +35,23 @@ jobs:
           repo sync -c -j$(nproc) --no-tags --no-clone-bundle
           
           echo ">> Constructing Kleaf workspace configuration..."
-          # Copy the workspace template instead of symlinking so we can append private OEM overrides
-          cp build/kernel/kleaf/WORKSPACE WORKSPACE
+          # Handle Android 15's new bazel.WORKSPACE structure gracefully
+          if [ -f build/kernel/kleaf/bazel.WORKSPACE ]; then
+            cp build/kernel/kleaf/bazel.WORKSPACE WORKSPACE
+          elif [ -f build/kernel/kleaf/WORKSPACE ]; then
+            cp build/kernel/kleaf/WORKSPACE WORKSPACE
+          else
+            echo ">> [FATAL] Kleaf Workspace template not found!" && exit 1
+          fi
+          
+          # Symlink modern Bzlmod definitions if Android 15 platform layer demands them
+          if [ -f build/kernel/kleaf/bzlmod/bazel.MODULE.bazel ]; then
+            ln -sf build/kernel/kleaf/bzlmod/bazel.MODULE.bazel MODULE.bazel
+          fi
+          if [ -f build/kernel/kleaf/bzlmod/bazel.WORKSPACE.bzlmod ]; then
+            ln -sf build/kernel/kleaf/bzlmod/bazel.WORKSPACE.bzlmod WORKSPACE.bzlmod
+          fi
+
           chmod +w WORKSPACE
           echo 'local_repository(name = "nt_project", path = "nt_project")' >> WORKSPACE
           
@@ -91,10 +106,11 @@ jobs:
           os.makedirs("nt_project", exist_ok=True)
           with open("nt_project/BUILD.bazel", "w") as f:
               f.write("")
+          with open("nt_project/MODULE.bazel", "w") as f:
+              f.write('module(name = "nt_project")\n')
 
           symbols = {}
           
-          # Recursively scan all Bazel architecture rules in the kernel to locate variables pulled from @nt_project
           for root, dirs, files in os.walk("msm-kernel"):
               for file in files:
                   if file.endswith(".bzl") or file in ["BUILD", "BUILD.bazel"]:
@@ -104,8 +120,6 @@ jobs:
                               content = f.read()
                           if "nt_project" in content:
                               print(f"[*] Found private OEM hook inside: {fn}")
-                              
-                              # Extract variable names being requested
                               matches = re.findall(r"load\s*\(\s*[\"\']@nt_project//:dict\.bzl[\"\']\s*,\s*([^)]+)\)", content)
                               for match in matches:
                                   for part in match.split(","):
@@ -116,11 +130,9 @@ jobs:
                                       else:
                                           sym = part.strip("\"").strip("'")
                                       if sym:
-                                          # Automatically guess expected data-type constraint (Lists vs Dicts)
                                           if "module" in sym.lower() or "out" in sym.lower() or "+" in content:
                                               symbols[sym] = "[]"
                                           else:
-                                              # Fallback dict maps core targets such as Metroid (Phone 3 / sm8735 platform configuration)
                                               symbols[sym] = '{"metroid": {}, "sun": {}, "pacman": {}, "pong": {}, "spock": {}, "default": {}}'
                       except Exception:
                           pass
