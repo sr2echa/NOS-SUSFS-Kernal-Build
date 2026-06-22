@@ -1,4 +1,5 @@
 name: Build Nothing OS 4.1 Kernel (SUSFS)
+
 on:
   workflow_dispatch:
 
@@ -46,7 +47,6 @@ jobs:
             TARGET_MOD="build/kernel/kleaf/bzlmod/bazel.MODULE.bazel"
           fi
 
-          # Clear automated read-only targets
           rm -f WORKSPACE MODULE.bazel
           
           echo ">> Writing customized independent Workspace parameters..."
@@ -108,7 +108,6 @@ jobs:
           fi
 
           echo ">> Force-registering Kconfig architectural symbol rules..."
-          # Define SUSFS natively inside filesystem definitions to prevent savedefconfig drops
           if ! grep -q "config SUSFS" fs/Kconfig; then
             cat << 'EOF' >> fs/Kconfig
 
@@ -120,7 +119,6 @@ config SUSFS
 EOF
           fi
 
-          # Ensure KernelSU-Next configurations are parsed correctly if missed by basic setup hooks
           if [ -d drivers/kernelsu ] && ! grep -q "kernelsu" drivers/Kconfig; then
             sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
           fi
@@ -193,7 +191,6 @@ EOF
 
           symbols = {}
           
-          # Force Kleaf integrity validation blocks to pass regardless of defconfig mutations
           for root, dirs, files in os.walk("build/kernel"):
               for file in files:
                   if file.endswith((".sh", ".py", ".bzl", ".bsh")):
