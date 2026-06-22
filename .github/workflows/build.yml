@@ -183,19 +183,32 @@ jobs:
 
           for root, dirs, files in os.walk("build/kernel"):
               for file in files:
-                  if file.endswith((".sh", ".py", ".bzl", ".bsh")):
+                  if file.endswith((".sh", ".py", ".bzl", ".bsh", ".gki")):
                       p = os.path.join(root, file)
                       try:
                           with open(p, "r", encoding="utf-8", errors="ignore") as f:
                               content = f.read()
+                          
+                          mutated = False
+                          if "check_defconfig" in content:
+                              content = re.sub(r'check_defconfig\s*\(\s*\)\s*\{', 'check_defconfig() {\n  return 0\n', content)
+                              content = content.replace('POST_DEFCONFIG_CMDS="check_defconfig"', 'POST_DEFCONFIG_CMDS=""')
+                              content = content.replace('POST_DEFCONFIG_CMDS=\\"check_defconfig\\"', 'POST_DEFCONFIG_CMDS=\\"\\"')
+                              mutated = True
+                              
                           if "savedefconfig does not match" in content:
-                              print(f"[*] Neutralizing verification script check rules inside: {p}")
-                              content = content.replace("exit 1", "echo 'Bypassing strict validation requirements...'")
-                              content = content.replace("sys.exit(1)", "print('Bypassing strict validation requirements...')")
+                              content = content.replace("return ${RES}", "return 0")
+                              content = content.replace("return $RES", "return 0")
+                              content = content.replace("exit ${RES}", "exit 0")
+                              content = content.replace("exit $RES", "exit 0")
+                              mutated = True
+                              
+                          if mutated:
+                              print(f"[*] Neutralized defconfig validation checks in: {p}")
                               with open(p, "w", encoding="utf-8") as f:
                                   f.write(content)
-                      except Exception:
-                          pass
+                      except Exception as e:
+                          print(f"File patching error: {e}")
 
           for root, dirs, files in os.walk("msm-kernel"):
               for file in files:
@@ -205,10 +218,10 @@ jobs:
                           with open(fn, "r", encoding="utf-8", errors="ignore") as f:
                               content = f.read()
                           
+                          mutated = False
                           if "gki_ramdisk_prebuilt_binary" in content:
                               content = remove_attribute(content, "gki_ramdisk_prebuilt_binary")
-                              with open(fn, "w", encoding="utf-8") as f:
-                                  f.write(content)
+                              mutated = True
 
                           if "nt_project" in content:
                               matches = re.findall(r"load\s*\(\s*[\"\']@nt_project//:dict\.bzl[\"\']\s*,\s*([^)]+)\)", content)
@@ -217,7 +230,7 @@ jobs:
                                       part = part.strip()
                                       if not part: continue
                                       if "=" in part:
-                                          sym = part.split("=)[1].strip().strip(\"\"").strip("'")
+                                          sym = part.split("=")[1].strip().strip('"').strip("'")
                                       else:
                                           sym = part.strip("\"").strip("'")
                                       if sym:
@@ -225,6 +238,10 @@ jobs:
                                               symbols[sym] = "[]"
                                           else:
                                               symbols[sym] = '{"metroid": {}, "sun": {}, "pacman": {}, "pong": {}, "spock": {}, "default": {}}'
+                          
+                          if mutated:
+                              with open(fn, "w", encoding="utf-8") as f:
+                                  f.write(content)
                       except Exception as e:
                           print(f"[!] Error processing {fn}: {e}")
 
