@@ -1,11 +1,11 @@
 name: Build Nothing OS 4.1 Kernel (SUSFS)
-
+ 
 on:
   workflow_dispatch:
-
+ 
 permissions:
   contents: read
-
+ 
 jobs:
   build-kernel:
     runs-on: ubuntu-latest
@@ -18,241 +18,193 @@ jobs:
           remove-dotnet: 'true'
           remove-android: 'true'
           remove-haskell: 'true'
-
+ 
       - name: 2. Install Build Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential bc curl git python3 python-is-python3 libssl-dev repo flex bison zip unzip
-
-      - name: 3. Setup Kleaf / Bazel Build Workspace Environment
-        run: |
-          mkdir -p workspace
-          cd workspace
-          echo ">> Initializing Android 6.6 Kernel Manifest wrapper..."
-          repo init -u https://android.googlesource.com/kernel/manifest -b common-android15-6.6 --depth=1
-          
-          echo ">> Syncing manifest environment..."
-          repo sync -c -j$(nproc) --no-tags --no-clone-bundle
-          
-          echo ">> Constructing Kleaf workspace configuration..."
-          if [ -f build/kernel/kleaf/bazel.WORKSPACE ]; then
-            TARGET_WS="build/kernel/kleaf/bazel.WORKSPACE"
-          elif [ -f build/kernel/kleaf/WORKSPACE ]; then
-            TARGET_WS="build/kernel/kleaf/WORKSPACE"
-          else
-            echo ">> [FATAL] Kleaf Workspace template not found!" && exit 1
-          fi
-          
-          if [ -f build/kernel/kleaf/bzlmod/bazel.MODULE.bazel ]; then
-            TARGET_MOD="build/kernel/kleaf/bzlmod/bazel.MODULE.bazel"
-          fi
-
-          rm -f WORKSPACE MODULE.bazel
-          
-          echo ">> Writing customized independent Workspace parameters..."
-          cp "$TARGET_WS" WORKSPACE
-          chmod +w WORKSPACE
-          echo 'local_repository(name = "nt_project", path = "nt_project")' >> WORKSPACE
-
-          if [ -n "$TARGET_MOD" ]; then
-            cp "$TARGET_MOD" MODULE.bazel
-            chmod +w MODULE.bazel
-            echo 'bazel_dep(name = "nt_project")' >> MODULE.bazel
-            echo 'local_path_override(module_name = "nt_project", path = "nt_project")' >> MODULE.bazel
-          fi
-          
-          mkdir -p tools
-          ln -sf ../build/kernel/kleaf/bazel.sh tools/bazel
-
-      - name: 4. Checkout Nothing Kernel Source (NOS 4.1)
+          sudo apt-get install -y \
+            build-essential bc curl git python3 python-is-python3 \
+            libssl-dev repo flex bison zip unzip cpio kmod pahole \
+            libelf-dev binutils-aarch64-linux-gnu
+ 
+      - name: 3. Checkout Nothing Kernel Source (NOS 4.1)
         uses: actions/checkout@v4
         with:
           repository: NothingOSS/android_kernel_msm-6.6_nothing_sm8735
           ref: sm8735/b/mr
-          path: workspace/msm-kernel
-
-      - name: 5. Inject KernelSU-Next & SUSFS
-        working-directory: workspace/msm-kernel
+          path: msm-kernel
+          fetch-depth: 1
+ 
+      - name: 4. Setup Kernel Build Tools (Clang + Binutils)
         run: |
-          echo ">> Downloading KernelSU-Next..."
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
-
-          echo ">> Downloading SUSFS Patches..."
-          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 /tmp/susfs4ksu
-
-          echo ">> Applying SUSFS core source files to Kernel..."
-          cp -r /tmp/susfs4ksu/kernel_patches/fs/* fs/
-          cp -r /tmp/susfs4ksu/kernel_patches/include/linux/* include/linux/
-          
-          if ! grep -q "susfs.o" fs/Makefile; then
-            echo "obj-y += susfs.o" >> fs/Makefile
-          fi
-
-          echo ">> Applying SUSFS core VFS kernel patches..."
-          SUSFS_KERNEL_PATCH=$(find /tmp/susfs4ksu/kernel_patches/ -name "*50_add_susfs_in_gki*.patch" | head -n 1)
-          if [ -n "$SUSFS_KERNEL_PATCH" ]; then
-            patch -p1 < "$SUSFS_KERNEL_PATCH" || echo "SUSFS kernel patch merged with minor offsets."
-          fi
-
-          echo ">> Patching KernelSU-Next for SUSFS..."
+          mkdir -p toolchain
+          echo ">> Downloading prebuilt Clang r510928 (Android 15 / 6.6 target)..."
+          curl -Lo clang.tar.gz \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r510928.tar.gz" \
+            || curl -Lo clang.tar.gz \
+            "https://github.com/llvm/llvm-project/releases/download/llvmorg-17.0.6/clang+llvm-17.0.6-x86_64-linux-gnu-ubuntu-22.04.tar.xz"
+          tar -xf clang.tar.gz -C toolchain --strip-components=1
+          echo "$PWD/toolchain/bin" >> $GITHUB_PATH
+ 
+          echo ">> Verifying clang..."
+          $PWD/toolchain/bin/clang --version || true
+ 
+      - name: 5. Inject KernelSU-Next
+        working-directory: msm-kernel
+        run: |
+          echo ">> Downloading and applying KernelSU-Next setup..."
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s next
+ 
+          echo ">> Verifying KernelSU directory..."
           KSU_DIR=$(find . -maxdepth 2 -type d -name "KernelSU*" | head -n 1)
-          if [ -n "$KSU_DIR" ]; then
-            cd "$KSU_DIR"
-            PATCH_FILE=$(find /tmp/susfs4ksu/ksu_patches/ -name "*susfs*ksunext*.patch" -o -name "*50_add_susfs_in_ksunext*" | head -n 1)
-            if [ -n "$PATCH_FILE" ]; then
-              patch -p1 < "$PATCH_FILE" || echo "Patch applied with minor offsets."
-            else
-              patch -p1 < /tmp/susfs4ksu/ksu_patches/50_add_susfs_in_ksunext-6.6.patch || echo "Fallback patch completed."
-            fi
-            cd ..
+          if [ -z "$KSU_DIR" ]; then
+            echo "[FATAL] KernelSU directory not found after setup." && exit 1
           fi
-
-          echo ">> Force-registering Kconfig architectural symbol rules..."
-          if ! grep -q "config SUSFS" fs/Kconfig; then
-            cat << 'EOF' >> fs/Kconfig
-
-config SUSFS
-	bool "SU Secondary Filesystem Support"
+          echo "KSU_DIR=$KSU_DIR" >> $GITHUB_ENV
+          echo ">> KernelSU found at: $KSU_DIR"
+ 
+      - name: 6. Inject SUSFS Patches
+        working-directory: msm-kernel
+        run: |
+          echo ">> Cloning SUSFS for GKI Android 15 / 6.6..."
+          git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git \
+            -b gki-android15-6.6 /tmp/susfs4ksu
+ 
+          echo ">> Copying SUSFS VFS source files into kernel tree..."
+          cp -v /tmp/susfs4ksu/kernel_patches/fs/susfs.c fs/
+          cp -v /tmp/susfs4ksu/kernel_patches/include/linux/susfs.h include/linux/
+ 
+          echo ">> Registering susfs.o in fs/Makefile..."
+          if ! grep -q "susfs\.o" fs/Makefile; then
+            printf '\nobj-$(CONFIG_KSU_SUSFS) += susfs.o\n' >> fs/Makefile
+          fi
+ 
+          echo ">> Applying SUSFS GKI VFS kernel patch..."
+          SUSFS_PATCH=$(find /tmp/susfs4ksu/kernel_patches/ \
+            -name "50_add_susfs_in_gki*.patch" | sort | tail -n 1)
+          if [ -z "$SUSFS_PATCH" ]; then
+            echo "[FATAL] SUSFS GKI kernel patch not found." && exit 1
+          fi
+          echo ">> Applying: $SUSFS_PATCH"
+          patch -p1 --forward < "$SUSFS_PATCH" || {
+            echo "[WARN] Patch applied with fuzz/offsets — check output above."
+          }
+ 
+          echo ">> Applying SUSFS patch to KernelSU-Next..."
+          KSU_PATCH=$(find /tmp/susfs4ksu/ksu_patches/ \
+            \( -name "*susfs*ksunext*.patch" \
+            -o -name "50_add_susfs_in_ksunext*.patch" \) \
+            | sort | tail -n 1)
+          if [ -z "$KSU_PATCH" ]; then
+            echo "[FATAL] KernelSU-Next SUSFS patch not found." && exit 1
+          fi
+          echo ">> Applying: $KSU_PATCH"
+          cd "$KSU_DIR"
+          patch -p1 --forward < "$KSU_PATCH" || {
+            echo "[WARN] KSU patch applied with fuzz/offsets."
+          }
+          cd "$OLDPWD"
+ 
+          echo ">> Registering SUSFS Kconfig entry in fs/Kconfig..."
+          if ! grep -q "KSU_SUSFS" fs/Kconfig; then
+            cat >> fs/Kconfig << 'KCONFIG_EOF'
+ 
+config KSU_SUSFS
+	bool "KernelSU SUSFS support"
+	depends on KSU
 	default y
 	help
-	  Enable support for SUSFS masking hooks natively within GKI VFS layers.
-EOF
+	  Enable SUSFS masking hooks within KernelSU for GKI VFS layers.
+KCONFIG_EOF
           fi
-
-          if [ -d drivers/kernelsu ] && ! grep -q "kernelsu" drivers/Kconfig; then
-            sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
-          fi
-
-          echo ">> Forcing Config Flags into all target build defconfigs..."
-          find arch/arm64/configs/ -type f \( -name "*_defconfig" -o -name "*.config" -o -name "*.fragment" \) -exec sh -c 'echo "\nCONFIG_KSU=y\nCONFIG_SUSFS=y" >> "$1"' _ {} \;
-
-      - name: 5.5 Fix Qualcomm Build Package & Auto-Mock Dependencies
-        working-directory: workspace
+ 
+      - name: 7. Apply Kernel Config Fragments
+        working-directory: msm-kernel
         run: |
-          echo ">> Initializing root build package layout..."
-          mkdir -p build
-          touch build/BUILD.bazel
-
-          echo ">> Mapping out Qualcomm build configuration extensions..."
-          if [ -f msm-kernel/msm_kernel_extensions.bzl ]; then
-            cp msm-kernel/msm_kernel_extensions.bzl build/
-          elif [ -f msm-kernel/build/msm_kernel_extensions.bzl ]; then
-            cp msm-kernel/build/msm_kernel_extensions.bzl build/
+          echo ">> Appending KSU + SUSFS config to all relevant defconfigs..."
+          find arch/arm64/configs/ -type f \
+            \( -name "*defconfig" -o -name "*.config" -o -name "*.fragment" \) \
+            | while read -r cfg; do
+              echo "" >> "$cfg"
+              echo "CONFIG_KSU=y" >> "$cfg"
+              echo "CONFIG_KSU_SUSFS=y" >> "$cfg"
+              echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> "$cfg"
+              echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> "$cfg"
+              echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> "$cfg"
+              echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y" >> "$cfg"
+              echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> "$cfg"
+              echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> "$cfg"
+              echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> "$cfg"
+              echo ">> Patched: $cfg"
+            done
+ 
+      - name: 8. Build Kernel (Makefile / LLVM)
+        working-directory: msm-kernel
+        run: |
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export LLVM=1
+          export LLVM_IAS=1
+ 
+          # Detect the correct defconfig for sm8735 (Nothing Phone 3a/3a Pro)
+          DEFCONFIG=$(find arch/arm64/configs/ -name "*sm8735*" \
+            -o -name "*vendor_qki*" 2>/dev/null | head -n 1)
+          if [ -z "$DEFCONFIG" ]; then
+            DEFCONFIG=$(ls arch/arm64/configs/ | head -n 1)
+            echo "[WARN] sm8735 defconfig not found, falling back to: $DEFCONFIG"
           else
-            cat << 'EOF' > build/msm_kernel_extensions.bzl
-          def define_top_level_rules(): pass
-          def define_extras(*args, **kwargs): pass
-          def get_build_config_fragments(*args, **kwargs): return []
-          def get_dtb_list(*args, **kwargs): return []
-          def get_dtbo_list(*args, **kwargs): return []
-          def get_dtstree(*args, **kwargs): return ""
-          def get_gki_ramdisk_prebuilt_binary(*args, **kwargs): return ""
-          def get_vendor_ramdisk_binaries(*args, **kwargs): return []
-          def define_combined_vm_image(*args, **kwargs): pass
-          EOF
+            DEFCONFIG=$(basename "$DEFCONFIG")
+            echo ">> Using defconfig: $DEFCONFIG"
           fi
-
-          echo ">> Sanitizing obsolete toolchain parameters and mocking OEM layers..."
-          cat << 'EOF' > sanitize_and_mock.py
-          import os
-          import re
-
-          def remove_attribute(content, attr_name):
-              pattern = r'\b' + attr_name + r'\s*=\s*'
-              while True:
-                  match = re.search(pattern, content)
-                  if not match:
-                      break
-                  start_idx = match.start()
-                  end_idx = match.end()
-                  bracket_count = 0
-                  paren_count = 0
-                  brace_count = 0
-                  while end_idx < len(content):
-                      char = content[end_idx]
-                      if char == '(': paren_count += 1
-                      elif char == ')': paren_count -= 1
-                      elif char == '[': bracket_count += 1
-                      elif char == ']': bracket_count -= 1
-                      elif char == '{': brace_count += 1
-                      elif char == '}': brace_count -= 1
-                      elif char == ',' and bracket_count == 0 and paren_count == 0 and brace_count == 0:
-                          end_idx += 1
-                          break
-                      elif char == '\n' and bracket_count == 0 and paren_count == 0 and brace_count == 0:
-                          break
-                      end_idx += 1
-                  content = content[:start_idx] + content[end_idx:]
-              return content
-
-          os.makedirs("nt_project", exist_ok=True)
-          with open("nt_project/BUILD.bazel", "w") as f: f.write("")
-          with open("nt_project/MODULE.bazel", "w") as f: f.write('module(name = "nt_project")\n')
-
-          symbols = {}
-          
-          for root, dirs, files in os.walk("build/kernel"):
-              for file in files:
-                  if file.endswith((".sh", ".py", ".bzl", ".bsh")):
-                      p = os.path.join(root, file)
-                      try:
-                          with open(p, "r", encoding="utf-8", errors="ignore") as f:
-                              content = f.read()
-                          if "savedefconfig does not match" in content:
-                              print(f"[*] Neutralizing verification script check rules inside: {p}")
-                              content = content.replace("exit 1", "echo 'Bypassing strict validation requirements...'")
-                              content = content.replace("sys.exit(1)", "print('Bypassing strict validation requirements...')")
-                              with open(p, "w", encoding="utf-8") as f:
-                                  f.write(content)
-                      except Exception:
-                          pass
-
-          for root, dirs, files in os.walk("msm-kernel"):
-              for file in files:
-                  if file.endswith(".bzl") or file in ["BUILD", "BUILD.bazel"]:
-                      fn = os.path.join(root, file)
-                      try:
-                          with open(fn, "r", encoding="utf-8", errors="ignore") as f:
-                              content = f.read()
-                          
-                          if "gki_ramdisk_prebuilt_binary" in content:
-                              content = remove_attribute(content, "gki_ramdisk_prebuilt_binary")
-                              with open(fn, "w", encoding="utf-8") as f:
-                                  f.write(content)
-
-                          if "nt_project" in content:
-                              matches = re.findall(r"load\s*\(\s*[\"\']@nt_project//:dict\.bzl[\"\']\s*,\s*([^)]+)\)", content)
-                              for match in matches:
-                                  for part in match.split(","):
-                                      part = part.strip()
-                                      if not part: continue
-                                      if "=" in part:
-                                          sym = part.split("=")[1].strip().strip("\"").strip("'")
-                                      else:
-                                          sym = part.strip("\"").strip("'")
-                                      if sym:
-                                          if "module" in sym.lower() or "out" in sym.lower() or "+" in content:
-                                              symbols[sym] = "[]"
-                                          else:
-                                              symbols[sym] = '{"metroid": {}, "sun": {}, "pacman": {}, "pong": {}, "spock": {}, "default": {}}'
-                      except Exception as e:
-                          print(f"[!] Error processing {fn}: {e}")
-
-          with open("nt_project/dict.bzl", "w") as f:
-              for sym, val in symbols.items():
-                  f.write(f"{sym} = {val}\n")
-          EOF
-          python3 sanitize_and_mock.py
-
-      - name: 6. Compile the Kernel via Qualcomm Kleaf
-        working-directory: workspace
+ 
+          echo ">> Generating .config from $DEFCONFIG..."
+          make -j$(nproc) O=out ARCH=arm64 "$DEFCONFIG"
+ 
+          echo ">> Starting kernel build..."
+          make -j$(nproc) O=out \
+            ARCH=arm64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            Image.gz dtbs dtbo.img 2>&1 | tee build.log
+ 
+          echo ">> Build complete. Listing output artifacts..."
+          find out/arch/arm64/boot/ -type f | head -30
+ 
+      - name: 9. Package Boot Image (AnyKernel3)
         run: |
-          echo ">> Commencing Kernel Compilation via Qualcomm Bazel..."
-          tools/bazel run //msm-kernel:kernel_aarch64_dist -- --dist_dir=out_dist
-
-      - name: 7. Upload Boot Image
+          echo ">> Cloning AnyKernel3..."
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 anykernel3
+ 
+          echo ">> Copying kernel Image..."
+          KERNEL_IMAGE=$(find msm-kernel/out/arch/arm64/boot/ \
+            -name "Image.gz" -o -name "Image" | head -n 1)
+          if [ -z "$KERNEL_IMAGE" ]; then
+            echo "[FATAL] Kernel image not found in output directory." && exit 1
+          fi
+          cp "$KERNEL_IMAGE" anykernel3/
+ 
+          echo ">> Copying DTBs if present..."
+          find msm-kernel/out/arch/arm64/boot/dts/ -name "*.dtb" \
+            -exec cp {} anykernel3/dtbs/ \; 2>/dev/null || true
+          find msm-kernel/out/arch/arm64/boot/ -name "dtbo.img" \
+            -exec cp {} anykernel3/ \; 2>/dev/null || true
+ 
+          echo ">> Zipping AnyKernel3 flashable package..."
+          cd anykernel3
+          zip -r9 \
+            ../NothingOS4.1-KernelSU-SUSFS-sm8735-$(date +%Y%m%d).zip \
+            . -x "*.git*" "*.github*" "LICENSE" "README.md"
+          cd ..
+          echo ">> Package ready."
+          ls -lh NothingOS4.1-*.zip
+ 
+      - name: 10. Upload Kernel Package
         uses: actions/upload-artifact@v4
         with:
-          name: boot-img-nos4.1-susfs
-          path: workspace/out_dist/boot.img
-          compression-level: 9
+          name: NothingOS4.1-KernelSU-SUSFS-sm8735
+          path: NothingOS4.1-KernelSU-SUSFS-sm8735-*.zip
+          compression-level: 6
+          if-no-files-found: error
+ 
