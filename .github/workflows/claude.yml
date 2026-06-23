@@ -1,4 +1,4 @@
-name: Build Nothing OS 4.1 Kernel (KSU-Next next-susfs + SUSFS v2)
+name: Build Nothing OS 4.1 Kernel (SukiSU Ultra + SUSFS v2.1.0+)
 
 on:
   push:
@@ -69,20 +69,24 @@ jobs:
           ref: sm8735/b/mr
           path: workspace/msm-kernel
 
-      - name: 5. Integrate KSU-Next (pershoot next-susfs, FORCED) + SUSFS VFS @ 2df41de
+      - name: 5. Integrate SukiSU Ultra (susfs-main, FORCED) + SUSFS VFS (simonpunk)
         working-directory: workspace/msm-kernel
         run: |
           set -e
 
-          # ROOT-CAUSE FIX: prior builds kept symlinking the WRONG (rifsxd) driver
-          # because pershoot's setup.sh only clones if KernelSU-Next/ is ABSENT
-          # (`test -d ... || git clone`). Something pre-populated that path, so the
-          # clone was skipped and the rifsxd driver (which does NOT define
-          # susfs_is_current_ksu_domain) got symlinked — hence the recurring
-          # undefined-symbol link error. We now: (1) WIPE any stale KSU dirs/symlink,
-          # (2) EXPLICITLY clone pershoot/KernelSU-Next next-susfs, (3) MANUALLY
-          # symlink it ourselves — bypassing the conditional entirely.
-          SUSFS_PIN="2df41de789026a6422521606402576507c687435"
+          # STRATEGY (proven on OnePlus Qualcomm android15-6.6, SUSFS v2.1.0+):
+          #   Manager: SukiSU Ultra, `susfs-main` branch. It uses simonpunk's susfs
+          #            API UNCHANGED (unlike pershoot, who altered the signatures and
+          #            caused the core_hook.c mismatch). So its core_hook.c matches
+          #            simonpunk's susfs.h.
+          #   VFS:     simonpunk susfs4ksu gki-android15-6.6 HEAD. Taking BOTH at
+          #            their current main-line heads keeps the manager/susfs versions
+          #            coherent (the lesson from every prior mismatch).
+          #   Hooks:   SukiSU default GKI = kprobes (CONFIG_KPROBES=y,
+          #            CONFIG_KSU_MANUAL_HOOK unset). So we do NOT apply the
+          #            60_scope-minimized_manual_hooks patch.
+          # We FORCE-clone SukiSU ourselves (its setup.sh is a no-op-if-present, the
+          # same trap that kept re-symlinking the wrong driver before).
 
           fail_on_rej() {
             local rejs
@@ -97,36 +101,29 @@ jobs:
             fi
           }
 
-          echo ">> STAGE 0: Wipe any pre-existing KernelSU / KernelSU-Next state"
-          rm -rf KernelSU-Next KernelSU
+          echo ">> STAGE 0: Wipe any pre-existing KSU state (avoid no-op-clone trap)"
+          rm -rf KernelSU KernelSU-Next SukiSU-Ultra
           [ -L drivers/kernelsu ] && rm -f drivers/kernelsu || true
           [ -d drivers/kernelsu ] && rm -rf drivers/kernelsu || true
-          # Strip any stale Makefile/Kconfig wiring so we re-add cleanly.
           sed -i '/kernelsu/d' drivers/Makefile 2>/dev/null || true
           sed -i '\#drivers/kernelsu/Kconfig#d' drivers/Kconfig 2>/dev/null || true
 
-          echo ">> STAGE 1: EXPLICITLY clone pershoot/KernelSU-Next (next-susfs)"
-          git clone --depth=1 -b next-susfs https://github.com/pershoot/KernelSU-Next KernelSU-Next
-          echo ">> Cloned pershoot next-susfs @ $(cd KernelSU-Next && git rev-parse --short HEAD)"
-          # Sanity: confirm we actually have pershoot's susfs-aware driver, which
-          # must reference the bridge symbol somewhere in its kernel/ sources.
-          if ! grep -rq "susfs_is_current_ksu_domain" KernelSU-Next/kernel/ 2>/dev/null; then
-            echo ">> [FATAL] Cloned KernelSU-Next does NOT contain susfs_is_current_ksu_domain."
-            echo ">> This is not the next-susfs (susfs-aware) driver. Aborting."
-            exit 1
+          echo ">> STAGE 1: EXPLICITLY clone SukiSU Ultra (susfs-main branch)"
+          git clone --depth=1 -b susfs-main https://github.com/SukiSU-Ultra/SukiSU-Ultra KernelSU
+          echo ">> Cloned SukiSU Ultra susfs-main @ $(cd KernelSU && git rev-parse --short HEAD)"
+          if [ ! -d KernelSU/kernel ]; then
+            echo ">> [FATAL] SukiSU Ultra clone has no kernel/ dir." && exit 1
           fi
-          echo ">> Confirmed: pershoot next-susfs driver defines the SUSFS bridge."
 
-          echo ">> STAGE 2: Manually symlink the driver into drivers/kernelsu"
-          ln -sf "$(realpath --relative-to=drivers KernelSU-Next/kernel)" drivers/kernelsu
+          echo ">> STAGE 2: Manually symlink the SukiSU driver into drivers/kernelsu"
+          ln -sf "$(realpath --relative-to=drivers KernelSU/kernel)" drivers/kernelsu
           grep -q "kernelsu" drivers/Makefile || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
           grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig || sed -i '/endmenu/i\source "drivers/kernelsu/Kconfig"' drivers/Kconfig
           echo ">> Driver symlinked: $(readlink -f drivers/kernelsu)"
 
-          echo ">> STAGE 3: Clone susfs4ksu @ $SUSFS_PIN (VFS layer source)"
-          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 /tmp/susfs4ksu
-          ( cd /tmp/susfs4ksu && git checkout "$SUSFS_PIN" )
-          echo ">> susfs4ksu pinned to $(cd /tmp/susfs4ksu && git rev-parse --short HEAD)"
+          echo ">> STAGE 3: Clone susfs4ksu gki-android15-6.6 (simonpunk, HEAD)"
+          git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 /tmp/susfs4ksu
+          echo ">> susfs4ksu @ $(cd /tmp/susfs4ksu && git rev-parse --short HEAD)"
 
           echo ">> STAGE 4: Copy SUSFS VFS sources + headers into tree"
           cp -v /tmp/susfs4ksu/kernel_patches/fs/* fs/
@@ -147,50 +144,28 @@ jobs:
           patch -p1 --fuzz=3 < "$GKI_PATCH" || true
           fail_on_rej
 
-          echo ">> STAGE 6: Apply manual-hooks patch (driver defaults to manual hooks)"
-          HOOK_PATCH=$(find /tmp/susfs4ksu -type f -name "*scope-minimized_manual_hooks*.patch" | head -n 1)
-          if [ -n "$HOOK_PATCH" ]; then
-            echo ">> Applying manual-hook patch: $HOOK_PATCH"
-            patch -p1 --fuzz=3 < "$HOOK_PATCH" || true
-            fail_on_rej
-          else
-            echo ">> [WARN] No scope-minimized_manual_hooks patch found in susfs4ksu."
-          fi
+          # NOTE: deliberately NOT applying 60_scope-minimized_manual_hooks.patch —
+          # SukiSU Ultra defaults to kprobe hooks on GKI, which need no hook patch.
 
-          echo ">> STAGE 7: Neutralize fingerprint modpost stub"
+          echo ">> STAGE 6: Neutralize fingerprint modpost stub"
           if [ -d drivers/input/fingerprint ]; then
             echo "obj-y =" > drivers/input/fingerprint/Makefile
           fi
 
-      - name: 6. ASSERT bridge symbol is defined in-tree BEFORE the long build
+      - name: 6. Sanity-check KSU driver + SUSFS wiring before the long build
         working-directory: workspace/msm-kernel
         run: |
           set -e
-          echo ">> Pre-build assertion: susfs_is_current_ksu_domain must be DEFINED"
-
-          # fs/susfs.c REFERENCES it; the KSU driver must DEFINE it. Search the
-          # driver sources for a definition (function body), not just a call.
-          DRIVER_SRC=$(find KernelSU-Next/kernel drivers/kernelsu -name "*.c" 2>/dev/null | sort -u)
-
-          if [ -z "$DRIVER_SRC" ]; then
-            echo ">> [FATAL] No KSU driver .c files found — driver not installed."; exit 1
-          fi
-
-          # A definition looks like: <type> susfs_is_current_ksu_domain(...) {
-          # We accept any .c line that has the name followed by '(' and is not
-          # a bare prototype ending in ';' on the same line.
-          if grep -rEn "susfs_is_current_ksu_domain\s*\(" $DRIVER_SRC | grep -vE ";\s*$" >/dev/null; then
-            echo ">> OK: susfs_is_current_ksu_domain is defined in the driver."
-          else
-            echo ">> [FATAL] susfs_is_current_ksu_domain is NOT defined in the driver sources."
-            echo ">> The driver references/declares but does not define it — likely a"
-            echo ">> hook-mode coupling (defined only under kprobes) or a driver/susfs"
-            echo ">> version drift. Dumping every occurrence for diagnosis:"
-            grep -rEn "susfs_is_current_ksu_domain" $DRIVER_SRC || true
-            echo ">> Also checking fs/susfs.c reference site:"
-            grep -nE "susfs_is_current_ksu_domain" fs/susfs.c || true
-            exit 1
-          fi
+          echo ">> Verifying driver + susfs are wired in"
+          [ -e drivers/kernelsu/core_hook.c ] || { echo ">> [FATAL] core_hook.c missing"; exit 1; }
+          [ -e fs/susfs.c ] || { echo ">> [FATAL] fs/susfs.c missing"; exit 1; }
+          [ -e include/linux/susfs.h ] || { echo ">> [FATAL] include/linux/susfs.h missing"; exit 1; }
+          grep -q "susfs.o" fs/Makefile || { echo ">> [FATAL] susfs.o not in fs/Makefile"; exit 1; }
+          grep -q "kernelsu" drivers/Makefile || { echo ">> [FATAL] kernelsu not in drivers/Makefile"; exit 1; }
+          echo ">> Driver: $(readlink -f drivers/kernelsu)"
+          echo ">> SUSFS header version line:"
+          grep -i "SUSFS_VERSION" include/linux/susfs.h || echo "   (version macro not found in header — informational)"
+          echo ">> OK: driver and SUSFS VFS both present and wired."
 
       - name: 7. Debug - dump module Makefile (ground truth)
         working-directory: workspace/msm-kernel
@@ -279,17 +254,21 @@ jobs:
             rm -rf "$tmpd"
           fi
 
-      - name: 10. Inject KSU + SUSFS + KPM config flags (NP2-minimal)
+      - name: 10. Inject KSU + SUSFS + KPM config flags (SukiSU kprobes defaults)
         working-directory: workspace/msm-kernel
         run: |
+          # SukiSU Ultra GKI default = kprobe hooks: CONFIG_KPROBES=y and
+          # CONFIG_KSU_MANUAL_HOOK left UNSET. KPM + KALLSYMS for module patching.
           find arch/arm64/configs/ -type f \( -name "*_defconfig" -o -name "*.config" -o -name "*.fragment" \) \
             -exec sh -c '
               echo "CONFIG_KSU=y" >> "$1"
               echo "CONFIG_KSU_SUSFS=y" >> "$1"
               echo "CONFIG_KPM=y" >> "$1"
+              echo "CONFIG_KPROBES=y" >> "$1"
+              echo "CONFIG_HAVE_KPROBES=y" >> "$1"
+              echo "CONFIG_KPROBE_EVENTS=y" >> "$1"
               echo "CONFIG_KALLSYMS=y" >> "$1"
               echo "CONFIG_KALLSYMS_ALL=y" >> "$1"
-              echo "CONFIG_KPROBES=y" >> "$1"
             ' _ {} \;
 
       - name: 11. Prepare Qualcomm Build Package Extensions
@@ -423,6 +402,6 @@ jobs:
       - name: 14. Upload Boot Image
         uses: actions/upload-artifact@v4
         with:
-          name: boot-img-nos4.1-ksunext-susfs-v2
+          name: boot-img-nos4.1-sukisu-susfs
           path: workspace/out_dist/boot.img
           compression-level: 9
