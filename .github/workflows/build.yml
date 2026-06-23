@@ -30,10 +30,10 @@ jobs:
           cd workspace
           echo ">> Initializing Android 6.6 Kernel Manifest wrapper..."
           repo init -u https://android.googlesource.com/kernel/manifest -b common-android15-6.6 --depth=1
-          
+
           echo ">> Syncing manifest environment..."
           repo sync -c -j$(nproc) --no-tags --no-clone-bundle
-          
+
           echo ">> Constructing Kleaf workspace configuration..."
           if [ -f build/kernel/kleaf/bazel.WORKSPACE ]; then
             TARGET_WS="build/kernel/kleaf/bazel.WORKSPACE"
@@ -42,14 +42,13 @@ jobs:
           else
             echo ">> [FATAL] Kleaf Workspace template not found!" && exit 1
           fi
-          
+
           if [ -f build/kernel/kleaf/bzlmod/bazel.MODULE.bazel ]; then
             TARGET_MOD="build/kernel/kleaf/bzlmod/bazel.MODULE.bazel"
           fi
 
           rm -f WORKSPACE MODULE.bazel
-          
-          echo ">> Writing customized independent Workspace parameters..."
+
           cp "$TARGET_WS" WORKSPACE
           chmod +w WORKSPACE
           echo 'local_repository(name = "nt_project", path = "nt_project")' >> WORKSPACE
@@ -60,7 +59,7 @@ jobs:
             echo 'bazel_dep(name = "nt_project")' >> MODULE.bazel
             echo 'local_path_override(module_name = "nt_project", path = "nt_project")' >> MODULE.bazel
           fi
-          
+
           mkdir -p tools
           ln -sf ../build/kernel/kleaf/bazel.sh tools/bazel
 
@@ -77,59 +76,87 @@ jobs:
           echo ">> Downloading KernelSU-Next..."
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
 
-          echo ">> Downloading SUSFS Patches..."
+          echo ">> Downloading SUSFS patches..."
           git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 /tmp/susfs4ksu
 
-          echo ">> Applying SUSFS core source files to Kernel..."
+          echo ">> Applying SUSFS core source files to kernel..."
           cp -r /tmp/susfs4ksu/kernel_patches/fs/* fs/
           cp -r /tmp/susfs4ksu/kernel_patches/include/linux/* include/linux/
-          
+
           if ! grep -q "susfs.o" fs/Makefile; then
             echo "obj-y += susfs.o" >> fs/Makefile
-            # Suppress all unused code warnings to ensure compilation finishes smoothly
             echo "CFLAGS_susfs.o += -Wno-unused-variable -Wno-unused-function -Wno-error" >> fs/Makefile
           fi
 
-          echo ">> Applying SUSFS core VFS kernel patches..."
+          echo ">> Applying SUSFS GKI VFS patch..."
           SUSFS_KERNEL_PATCH=$(find /tmp/susfs4ksu/kernel_patches/ -name "*50_add_susfs_in_gki*.patch" | head -n 1)
           if [ -n "$SUSFS_KERNEL_PATCH" ]; then
-            patch -p1 < "$SUSFS_KERNEL_PATCH" || echo "SUSFS kernel patch merged."
+            patch -p1 --fuzz=3 < "$SUSFS_KERNEL_PATCH" || true
           fi
 
-          echo ">> Patching KernelSU-Next for SUSFS..."
-          # Target the lowercase folder layout used by the installer toolchain
-          if [ -d drivers/kernelsu ]; then
-            cd drivers/kernelsu
-            PATCH_FILE=$(find /tmp/susfs4ksu/ksu_patches/ -name "*susfs*ksunext*.patch" -o -name "*50_add_susfs_in_ksunext*" | head -n 1)
-            if [ -n "$PATCH_FILE" ]; then
-              patch -p1 < "$PATCH_FILE" || echo "SUSFS patch applied directly to KernelSU-Next."
-            else
-              patch -p1 < /tmp/susfs4ksu/ksu_patches/50_add_susfs_in_ksunext-6.6.patch || echo "Fallback KSU patch completed."
-            fi
-            cd ../..
+          echo ">> Locating KernelSU-Next root directory..."
+          # setup.sh creates KernelSU-Next/ at the kernel root and symlinks
+          # drivers/kernelsu -> KernelSU-Next/kernel/
+          # The SUSFS KSU patch must be applied from KernelSU-Next/ root (NOT
+          # from inside drivers/kernelsu) because patch paths are kernel/file.c
+          # relative to that root. Applying from within the symlink target causes
+          # path resolution to fail silently, leaving susfs_is_current_ksu_domain
+          # undefined at link time.
+          KSU_ROOT=$(find . -maxdepth 1 -type d -name "KernelSU*" | head -n 1)
+
+          if [ -z "$KSU_ROOT" ] && [ -L drivers/kernelsu ]; then
+            # Resolve symlink: drivers/kernelsu -> .../KernelSU-Next/kernel
+            # Go one level up to get the KernelSU-Next root
+            KSU_ROOT=$(dirname "$(readlink -f drivers/kernelsu)")
           fi
+
+          if [ -z "$KSU_ROOT" ]; then
+            echo "[FATAL] Could not locate KernelSU-Next root directory!" && exit 1
+          fi
+
+          echo ">> KernelSU-Next root resolved to: $KSU_ROOT"
+
+          PATCH_FILE=$(find /tmp/susfs4ksu/ksu_patches/ \
+            \( -name "*susfs*ksunext*.patch" -o -name "*50_add_susfs_in_ksunext*" \) \
+            | head -n 1)
+
+          if [ -z "$PATCH_FILE" ]; then
+            PATCH_FILE="/tmp/susfs4ksu/ksu_patches/50_add_susfs_in_ksunext-6.6.patch"
+          fi
+
+          echo ">> Applying KSU patch from root: $PATCH_FILE"
+          (cd "$KSU_ROOT" && patch -p1 --fuzz=3 < "$PATCH_FILE")
+
+          # Hard verification — if this symbol is missing the build will fail at link
+          if ! grep -rq "susfs_is_current_ksu_domain" "$KSU_ROOT"; then
+            echo "[FATAL] KSU SUSFS patch did not introduce susfs_is_current_ksu_domain."
+            echo "        Patch likely failed to apply. Check patch file compatibility."
+            exit 1
+          fi
+          echo ">> KSU SUSFS patch verified OK."
 
           if [ -d drivers/kernelsu ] && ! grep -q "kernelsu" drivers/Kconfig; then
             sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
           fi
 
-          echo ">> Neutralizing problematic fingerprint module that triggers modpost errors..."
+          echo ">> Neutralizing fingerprint module..."
           if [ -d drivers/input/fingerprint ]; then
             echo "obj-y =" > drivers/input/fingerprint/Makefile
           fi
 
-          echo ">> Forcing Config Flags into all target build defconfigs..."
-          find arch/arm64/configs/ -type f \( -name "*_defconfig" -o -name "*.config" -o -name "*.fragment" \) -exec sh -c '
-            echo "CONFIG_KSU=y" >> "$1"
-            echo "CONFIG_KSU_SUSFS=y" >> "$1"
-            echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> "$1"
-            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> "$1"
-            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> "$1"
-            echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> "$1"
-            echo "CONFIG_KSU_SUSFS_SPOOFER=y" >> "$1"
-            echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> "$1"
-            echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> "$1"
-          ' _ {} \;
+          echo ">> Injecting KSU and SUSFS config flags into defconfigs..."
+          find arch/arm64/configs/ -type f \( -name "*_defconfig" -o -name "*.config" -o -name "*.fragment" \) \
+            -exec sh -c '
+              echo "CONFIG_KSU=y" >> "$1"
+              echo "CONFIG_KSU_SUSFS=y" >> "$1"
+              echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> "$1"
+              echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> "$1"
+              echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> "$1"
+              echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> "$1"
+              echo "CONFIG_KSU_SUSFS_SPOOFER=y" >> "$1"
+              echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> "$1"
+              echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> "$1"
+            ' _ {} \;
 
       - name: 6. Prepare Qualcomm Build Package Extensions
         working-directory: workspace
@@ -200,23 +227,20 @@ jobs:
                       try:
                           with open(p, "r", encoding="utf-8", errors="ignore") as f:
                               content = f.read()
-                          
                           mutated = False
                           if "check_defconfig" in content:
                               content = re.sub(r'check_defconfig\s*\(\s*\)\s*\{', 'check_defconfig() {\n  return 0\n', content)
                               content = content.replace('POST_DEFCONFIG_CMDS="check_defconfig"', 'POST_DEFCONFIG_CMDS=""')
                               content = content.replace('POST_DEFCONFIG_CMDS=\\"check_defconfig\\"', 'POST_DEFCONFIG_CMDS=\\"\\"')
                               mutated = True
-                              
                           if "savedefconfig does not match" in content:
                               content = content.replace("return ${RES}", "return 0")
                               content = content.replace("return $RES", "return 0")
                               content = content.replace("exit ${RES}", "exit 0")
                               content = content.replace("exit $RES", "exit 0")
                               mutated = True
-                              
                           if mutated:
-                              print(f"[*] Neutralized defconfig validation checks in: {p}")
+                              print(f"[*] Neutralized defconfig validation in: {p}")
                               with open(p, "w", encoding="utf-8") as f:
                                   f.write(content)
                       except Exception as e:
@@ -229,12 +253,10 @@ jobs:
                       try:
                           with open(fn, "r", encoding="utf-8", errors="ignore") as f:
                               content = f.read()
-                          
                           mutated = False
                           if "gki_ramdisk_prebuilt_binary" in content:
                               content = remove_attribute(content, "gki_ramdisk_prebuilt_binary")
                               mutated = True
-
                           if "nt_project" in content:
                               matches = re.findall(r"load\s*\(\s*[\"\']@nt_project//:dict\.bzl[\"\']\s*,\s*([^)]+)\)", content)
                               for match in matches:
@@ -250,7 +272,6 @@ jobs:
                                               symbols[sym] = "[]"
                                           else:
                                               symbols[sym] = '{"metroid": {}, "sun": {}, "pacman": {}, "pong": {}, "spock": {}, "default": {}}'
-                          
                           if mutated:
                               with open(fn, "w", encoding="utf-8") as f:
                                   f.write(content)
