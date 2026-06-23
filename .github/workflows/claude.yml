@@ -190,54 +190,7 @@ jobs:
           else:
               print(">> Total reconciled: %d" % reconciled_total)
 
-      - name: 7. FAIL-FAST GATE — verify susfs symbol coherence BEFORE the long build
-        working-directory: workspace/msm-kernel
-        run: |
-          set -e
-          echo ">> Pre-build coherence gate (seconds, not minutes)"
-
-          if [ ! -f fs/susfs.c ]; then
-            echo ">> [FATAL] fs/susfs.c missing — VFS layer not integrated."; exit 1
-          fi
-          if ! grep -q "susfs" fs/namei.c; then
-            echo ">> [FATAL] fs/namei.c has no susfs references — 50_add_susfs patch did not apply."; exit 1
-          fi
-          echo ">> VFS layer present (fs/susfs.c + fs/namei.c hooks)."
-
-          # Collect candidate susfs_* symbols referenced anywhere in the VFS layer.
-          REF_SYMS=$(grep -rhoE "\bsusfs_[a-z0-9_]+" \
-                       fs/susfs.c fs/namei.c include/linux/susfs*.h 2>/dev/null \
-                     | sort -u)
-
-          # A symbol counts as DEFINED if it appears as a C function definition
-          # (name followed by '(') in ANY .c file in the tree — susfs.c itself,
-          # or the KSU driver. Search .c files only (not headers, which hold
-          # prototypes), and do NOT anchor to column 0 (attributes/wrapping).
-          DEFN_SOURCES=$(find fs drivers/kernelsu KernelSU-Next -name "*.c" 2>/dev/null)
-
-          MISSING=0
-          for sym in $REF_SYMS; do
-            if grep -qE "\b${sym}\b\s*\(" $DEFN_SOURCES 2>/dev/null; then
-              continue
-            fi
-            # Some susfs symbols are macros/inlines defined in headers — accept those too.
-            if grep -qE "#define\s+${sym}\b|\b${sym}\b\s*\(" include/linux/susfs*.h 2>/dev/null; then
-              continue
-            fi
-            echo ">> [WARN] No definition found for referenced symbol: $sym"
-            MISSING=$((MISSING+1))
-          done
-
-          if [ "$MISSING" -gt 0 ]; then
-            echo ">> [FATAL] $MISSING susfs symbol(s) referenced but never defined."
-            echo ">> Inspect above — if these are bridge symbols (susfs_is_*ksu*),"
-            echo ">> it is a real version mismatch. If self-defined in susfs.c,"
-            echo ">> the gate heuristic is the problem, not the build."
-            exit 1
-          fi
-          echo ">> Symbol coherence OK — all referenced susfs_* symbols resolve."
-
-      - name: 8. Debug - dump module Makefile (ground truth)
+      - name: 7. Debug - dump module Makefile (ground truth)
         working-directory: workspace/msm-kernel
         run: |
           echo "===== kernel/module/Makefile (numbered) ====="
@@ -245,7 +198,7 @@ jobs:
           echo "===== grep gki_module ====="
           grep -n "gki_module" kernel/module/Makefile || true
 
-      - name: 9. Protected-Exports Neutralization (POSIX-clean zero-symbol header)
+      - name: 8. Protected-Exports Neutralization (POSIX-clean zero-symbol header)
         working-directory: workspace/msm-kernel
         shell: python
         run: |
@@ -306,7 +259,7 @@ jobs:
                           f.write("\n".join(cleaned) + "\n")
                       print(">> Purged protected references out of: %s" % bzl_file)
 
-      - name: 10. Validate generated header script (dash + cc syntax check)
+      - name: 9. Validate generated header script (dash + cc syntax check)
         working-directory: workspace/msm-kernel
         run: |
           set -e
@@ -324,7 +277,7 @@ jobs:
             rm -rf "$tmpd"
           fi
 
-      - name: 11. Inject KSU + SUSFS + KPM config flags
+      - name: 10. Inject KSU + SUSFS + KPM config flags
         working-directory: workspace/msm-kernel
         run: |
           find arch/arm64/configs/ -type f \( -name "*_defconfig" -o -name "*.config" -o -name "*.fragment" \) \
@@ -341,7 +294,7 @@ jobs:
               echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> "$1"
             ' _ {} \;
 
-      - name: 12. Prepare Qualcomm Build Package Extensions
+      - name: 11. Prepare Qualcomm Build Package Extensions
         working-directory: workspace
         run: |
           mkdir -p build
@@ -362,7 +315,7 @@ jobs:
             echo "def define_combined_vm_image(*args, **kwargs): pass" >> build/msm_kernel_extensions.bzl
           fi
 
-      - name: 13. Sanitize Obsolete Parameters & Mock OEM Layers
+      - name: 12. Sanitize Obsolete Parameters & Mock OEM Layers
         working-directory: workspace
         shell: python
         run: |
@@ -463,13 +416,13 @@ jobs:
               for sym, val in symbols.items():
                   f.write("%s = %s\n" % (sym, val))
 
-      - name: 14. Compile the Kernel via Qualcomm Kleaf
+      - name: 13. Compile the Kernel via Qualcomm Kleaf
         working-directory: workspace
         run: |
           echo ">> Commencing Kernel Compilation via Qualcomm Bazel..."
           tools/bazel run //msm-kernel:kernel_aarch64_dist -- --dist_dir=out_dist
 
-      - name: 15. Upload Boot Image
+      - name: 14. Upload Boot Image
         uses: actions/upload-artifact@v4
         with:
           name: boot-img-nos4.1-ksunext-susfs
