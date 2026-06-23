@@ -1,4 +1,53 @@
-name: DIAGNOSTIC - KSU-Next v3.2.0 + SUSFS symbol/version audit
+name: Build NOS 4.1 Kernel (NP3 / metroid) - KSU-Next [next] + SUSFS v2.x (kprobe hooks)
+
+# ============================================================================
+# WHAT CHANGED vs your failing workflow (and why it now links cleanly)
+# ----------------------------------------------------------------------------
+# ROOT CAUSE history (each build got one step further):
+#   (1) Original: KSU-Next default branch + TheWildJames susfs_fix_patches, applied
+#       by a helper that SILENTLY SKIPPED non-applying patches -> inconsistent driver
+#       -> sucompat.c errors (ksu_su_compat_enabled redef, struct user_arg_ptr, etc.).
+#   (2) Then: simonpunk 50_ applied cleanly, but its 6.6 branch ships NO 60_ manual
+#       hooks patch -> hard-fail at the hooks stage.
+#   (3) Then: added KernelSU-Next/kernel_patches min_scope_syscall_hooks_v1.4 +
+#       CONFIG_KSU_MANUAL_HOOK=y, but ALSO forced CONFIG_KPROBES=y. That pushed the
+#       driver into KPROBE mode (so it did not emit the manual symbols) while the
+#       patched kernel source still CALLED them -> vmlinux link failed:
+#         ld.lld: undefined symbol: ksu_execveat_hook / ksu_handle_sys_read /
+#                 ksu_handle_faccessat / ksu_handle_stat / ksu_input_hook / ...
+#   (4) Also: goodix_fp.ko referenced Nothing vendor symbols (touchpanel_event_* /
+#       nt_display_event_*) -> fixed by forcing modpost to warn (Step 12b).
+#
+# THE FIX (this file) - one CONSISTENT hook story, no cross-fork patch drift:
+#   1) SUSFS kernel side: simonpunk susfs4ksu @ gki-android15-6.6 -> copy fs/* +
+#      include/linux/*, apply 50_add_susfs (applies cleanly; SUSFS v2.x). This is what
+#      provides ALL SUSFS hiding (sus_path/mount/kstat/uname) and is INDEPENDENT of how
+#      KSU hooks su.
+#   2) KSU hook method = KPROBES (KSU-Next's recommended default on GKI). We apply NO
+#      kernel-source hook patch, so there is nothing to leave undefined at link. The
+#      driver registers its hooks via kprobes at runtime.
+#   3) Driver: OFFICIAL KernelSU-Next `next` setup.sh (susfs-aware, supports 6.6, same
+#      family as your installed v3.2.0 manager).
+#   4) Config: CONFIG_KSU=y + CONFIG_KSU_SUSFS*=y, KEEP CONFIG_KPROBES=y, and do NOT set
+#      CONFIG_KSU_MANUAL_HOOK. (Disabling CONFIG_KPROBES to use manual hooks breaks
+#      unrelated GKI drivers per KSU-Next#216, so kprobe mode is the clean route here.)
+#   5) Step 12b forces modpost to warn so goodix_fp.ko's runtime-resolved vendor symbols
+#      don't fail the build. Your working Kleaf harness / protected-export / defconfig
+#      sanitization are untouched.
+#
+#   TRADEOFF (honest): kprobe hooks are more detectable than manual hooks; the manager's
+#   "SUS SU mode 2" will read disabled. Core SUSFS hiding is unaffected. If you later want
+#   manual hooks specifically, that requires getting the driver's hook config to match a
+#   manual-hooks patch AND not tripping the kprobe/USB issue -- see chat notes; SukiSU-Ultra
+#   susfs-main (one self-contained source) is the cleaner route to manual/VFS hooks.
+#   NOTE: not test-compiled here (sandbox network is restricted); canaries fail fast.
+#
+# FEATURE PRESERVATION (Glyph Matrix / camera / fingerprint):
+#   We never stub or remove anything from Nothing's defconfig. Step 10 is
+#   APPEND-ONLY. Vendor drivers build from Nothing's tree as-is. The only thing
+#   we relax is the GKI protected-export ENFORCEMENT (steps 8-9) which is
+#   required for ANY out-of-tree/vendor module to load (Wi-Fi/BT/etc.).
+# ============================================================================
 
 on:
   push:
@@ -7,76 +56,540 @@ on:
 permissions:
   contents: read
 
+env:
+  # ---- PINNED INPUTS (the whole point: no floating HEADs) -------------------
+  KERNEL_REPO: "NothingOSS/android_kernel_msm-6.6_nothing_sm8735"
+  KERNEL_REF:  "sm8735/b/mr"
+  SUSFS_BRANCH: "gki-android15-6.6"   # simonpunk SUSFS line for android15-6.6 (currently v2.x)
+  KSUN_BRANCH:  "next"                # OFFICIAL KSU-Next driver branch (susfs-aware; supports 4.4-6.6)
+  # (kprobe hook mode: no kernel-source hook patch repo is needed)
+  # Once you get a green build, replace the branch clones below with the exact
+  # commit SHAs they resolved to (printed in the logs) for full reproducibility.
+
 jobs:
-  diagnose:
+  build-kernel:
     runs-on: ubuntu-latest
     steps:
-      - name: Install patchutils
-        run: sudo apt-get update && sudo apt-get install -y patchutils
+      - name: 1. Maximize Build Space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 8192
+          swap-size-mb: 8192
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
 
-      - name: Clone KernelSU-Next (stable tag) + susfs4ksu (HEAD)
+      - name: 2. Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc curl git python3 python-is-python3 libssl-dev repo flex bison zip unzip
+
+      - name: 3. Setup Kleaf / Bazel Build Workspace Environment
+        run: |
+          mkdir -p workspace
+          cd workspace
+          echo ">> Initializing Android 6.6 Kernel Manifest wrapper..."
+          repo init -u https://android.googlesource.com/kernel/manifest -b common-android15-6.6 --depth=1
+          echo ">> Syncing manifest environment..."
+          repo sync -c -j$(nproc) --no-tags --no-clone-bundle
+
+          echo ">> Constructing Kleaf workspace configuration..."
+          if [ -f build/kernel/kleaf/bazel.WORKSPACE ]; then
+            TARGET_WS="build/kernel/kleaf/bazel.WORKSPACE"
+          elif [ -f build/kernel/kleaf/WORKSPACE ]; then
+            TARGET_WS="build/kernel/kleaf/WORKSPACE"
+          else
+            echo ">> [FATAL] Kleaf Workspace template not found!" && exit 1
+          fi
+
+          if [ -f build/kernel/kleaf/bzlmod/bazel.MODULE.bazel ]; then
+            TARGET_MOD="build/kernel/kleaf/bzlmod/bazel.MODULE.bazel"
+          fi
+
+          rm -f WORKSPACE MODULE.bazel
+          cp "$TARGET_WS" WORKSPACE
+          chmod +w WORKSPACE
+          echo 'local_repository(name = "nt_project", path = "nt_project")' >> WORKSPACE
+
+          if [ -n "$TARGET_MOD" ]; then
+            cp "$TARGET_MOD" MODULE.bazel
+            chmod +w MODULE.bazel
+            echo 'bazel_dep(name = "nt_project")' >> MODULE.bazel
+            echo 'local_path_override(module_name = "nt_project", path = "nt_project")' >> MODULE.bazel
+          fi
+
+          mkdir -p tools
+          ln -sf ../build/kernel/kleaf/bazel.sh tools/bazel
+
+      - name: 4. Checkout Nothing Kernel Source (NOS 4.1)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.KERNEL_REPO }}
+          ref: ${{ env.KERNEL_REF }}
+          path: workspace/msm-kernel
+
+      - name: 5. Integrate SUSFS v2.x (VFS 50_) + official KSU-Next driver (kprobe hooks)
+        working-directory: workspace/msm-kernel
+        shell: bash
         run: |
           set -e
-          git clone https://github.com/KernelSU-Next/KernelSU-Next KSU
-          cd KSU
-          TAG=$(git describe --tags --abbrev=0)
-          git checkout -q "$TAG"
-          echo "KSU_TAG=$TAG" >> "$GITHUB_ENV"
-          echo ">> KSU-Next tag: $TAG @ $(git rev-parse --short HEAD)"
-          cd ..
-          git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 SUSFS
-          echo ">> susfs4ksu @ $(cd SUSFS && git rev-parse --short HEAD)"
 
-      - name: "AUDIT 1 — KSU-Next tree + version markers"
-        run: |
-          echo "===== KSU-Next tag: $KSU_TAG ====="
-          echo "----- kernel/ files -----"
-          find KSU/kernel -maxdepth 2 -type f | sort
-          echo "----- version / susfs config markers -----"
-          grep -rn 'KSU_VERSION\|VERSION_TAG\|SUSFS' KSU/kernel/Makefile KSU/kernel/Kconfig 2>/dev/null || true
+          echo ">> STAGE 0: Clean any prior KSU/SUSFS state (avoid double-wiring)"
+          rm -rf KernelSU KernelSU-Next SukiSU-Ultra /tmp/susfs4ksu
+          [ -L drivers/kernelsu ] && rm -f drivers/kernelsu || true
+          [ -d drivers/kernelsu ] && rm -rf drivers/kernelsu || true
+          # IMPORTANT: do NOT pre-edit drivers/Makefile or drivers/Kconfig here.
+          # KSU-Next's setup.sh wires them itself; pre-editing creates duplicate
+          # entries / breaks the symlink it creates.
 
-      - name: "AUDIT 2 — is susfs_is_current_ksu_domain referenced in v3.2.0?"
-        run: |
-          echo "===== susfs_is_current_ksu_domain in KSU-Next ====="
-          grep -rn 'susfs_is_current_ksu_domain' KSU/ || echo "   (NOT referenced anywhere in KSU-Next $KSU_TAG)"
+          echo ">> STAGE 1: Clone susfs4ksu (simonpunk) @ ${SUSFS_BRANCH}  [SUSFS v2.x]"
+          git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b "${SUSFS_BRANCH}" /tmp/susfs4ksu
+          echo ">> susfs4ksu @ $(git -C /tmp/susfs4ksu rev-parse --short HEAD)  <-- pin this SHA later"
 
-      - name: "AUDIT 3 — every susfs_ symbol KSU-Next expects"
-        run: |
-          echo "===== susfs_ symbols referenced in KSU-Next (with counts) ====="
-          grep -rhoE '\bsusfs_[a-zA-Z0-9_]+' KSU/kernel | sort | uniq -c | sort -rn
+          echo ">> STAGE 2: Copy SUSFS kernel-side VFS sources + headers into the tree"
+          cp -v /tmp/susfs4ksu/kernel_patches/fs/* fs/
+          cp -v /tmp/susfs4ksu/kernel_patches/include/linux/* include/linux/
 
-      - name: "AUDIT 4 — the build-#7 errored functions, in CLEAN v3.2.0"
-        run: |
-          echo "===== ksu_handle_setresuid / ksu_execve_hook_ksud / ksu_hook_setresuid (clean tree) ====="
-          grep -rn 'ksu_handle_setresuid\|ksu_execve_hook_ksud\|ksu_hook_setresuid\|ksu_handle_execve_ksud' KSU/kernel || echo "   (none)"
+          echo ">> STAGE 3: Assert SUSFS is v2.x (gki-android15-6.6 currently ships v2.x)"
+          SUSFS_VER=$(grep -rhoE '#define[[:space:]]+SUSFS_VERSION[[:space:]]+"[^"]+"' include/linux/ \
+                        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+          echo ">> Detected SUSFS_VERSION: ${SUSFS_VER:-<none>}"
+          case "$SUSFS_VER" in
+            2.*) echo ">> OK: SUSFS v2.x confirmed." ;;
+            *)   echo ">> [FATAL] Expected SUSFS v2.x on ${SUSFS_BRANCH}, got '${SUSFS_VER:-none}'."; exit 1 ;;
+          esac
 
-      - name: "AUDIT 5 — susfs.c <-> KSU interface (HEAD)"
-        run: |
-          echo "===== susfs.h SUSFS_VERSION ====="
-          grep -hn 'SUSFS_VERSION' SUSFS/kernel_patches/include/linux/susfs.h || true
-          echo "===== susfs.c extern declarations (what it expects KSU to define) ====="
-          grep -nE 'extern ' SUSFS/kernel_patches/fs/susfs.c || true
-          echo "===== susfs.c call sites of susfs_is_current_ksu_domain ====="
-          grep -n 'susfs_is_current_ksu_domain' SUSFS/kernel_patches/fs/susfs.c || true
+          echo ">> STAGE 4: Apply SUSFS kernel-side VFS patch (50_add_susfs)"
+          GKI_PATCH=$(find /tmp/susfs4ksu/kernel_patches -maxdepth 1 -name '50_add_susfs_in_gki-android15-6.6.patch' | head -1)
+          [ -z "$GKI_PATCH" ] && GKI_PATCH=$(find /tmp/susfs4ksu/kernel_patches -maxdepth 1 -name '50_add_susfs_in_gki-*6.6*.patch' | head -1)
+          [ -n "$GKI_PATCH" ] || { echo ">> [FATAL] 50_add_susfs patch not found"; exit 1; }
+          echo ">> VFS patch: $GKI_PATCH"
+          patch -p1 --no-backup-if-mismatch --fuzz=3 < "$GKI_PATCH"
 
-      - name: "AUDIT 6 — how the KSU-side patch DEFINES the symbol (+ rename evidence)"
-        run: |
-          KP=$(find SUSFS -path '*KernelSU*' -iname '*enable_susfs*.patch' | head -1)
-          echo ">> patch: $KP"
-          echo "===== files the patch touches ====="
-          lsdiff "$KP" | sed 's#^#   #'
-          echo "===== where the relevant symbols appear in the patch ====="
-          grep -nE 'susfs_is_current_ksu_domain|ksu_handle_setresuid|ksu_execve_hook_ksud|ksu_hook_setresuid' "$KP" | sed 's#^#   #'
-          echo "===== FULL selinux.c hunk (contains the definition) ====="
-          filterdiff -i '*selinux.c' "$KP" | cat
-          echo "===== FULL selinux.h hunk ====="
-          filterdiff -i '*selinux.h' "$KP" | cat
+          echo ">> STAGE 5: Hook method = KPROBES (KSU-Next default; recommended on GKI)"
+          # WHY THIS CHANGED (read this before re-adding a hooks patch):
+          #   A previous version applied min_scope_syscall_hooks_v1.4.patch, which inserts
+          #   ksu_handle_* CALLS into fs/exec.c, fs/open.c, fs/read_write.c, fs/stat.c and
+          #   drivers/input/input.c. Those symbols are only PROVIDED by the driver when it
+          #   is built in manual/syscall-hook mode. With CONFIG_KPROBES=y the driver builds
+          #   in KPROBE mode and does NOT emit them, so vmlinux failed to link:
+          #     ld.lld: error: undefined symbol: ksu_execveat_hook / ksu_handle_sys_read /
+          #             ksu_handle_faccessat / ksu_handle_stat / ksu_input_hook / ...
+          #   The "just disable CONFIG_KPROBES" fix breaks unrelated GKI drivers (USB), so on
+          #   this kernel the clean answer is to NOT patch the kernel source at all and let
+          #   KSU-Next register its hooks via kprobes at runtime (its recommended default).
+          #   SUSFS hiding does NOT depend on this: it runs through the 50_ VFS patch
+          #   (STAGE 4), which is independent of how KSU hooks su.
+          #   Tradeoff: kprobe hooks are more detectable; "SUS SU mode 2" will show disabled.
+          #   Core SUSFS (sus_path / sus_mount / sus_kstat / spoof_uname) is unaffected.
+          echo ">> No kernel-source hook patch applied (kprobe mode). KSU_PATCHES_REPO unused."
 
-      - name: "AUDIT 7 — does v3.2.0's selinux.c have the deps the definition needs?"
+          echo ">> STAGE 6: Fail HARD on any reject (never proceed on a partial tree)"
+          REJ=$(find . -name '*.rej' -not -path './.git/*' 2>/dev/null || true)
+          if [ -n "$REJ" ]; then
+            echo ">> [FATAL] Patch rejects present:"
+            for r in $REJ; do echo "----- $r -----"; cat "$r"; done
+            exit 1
+          fi
+
+          echo ">> STAGE 6b: Belt-and-suspenders fs/Makefile wiring for susfs.o"
+          if ! grep -q 'susfs\.o' fs/Makefile; then
+            echo 'obj-$(CONFIG_KSU_SUSFS) += susfs.o' >> fs/Makefile
+          fi
+          grep -q 'CFLAGS_susfs.o' fs/Makefile || \
+            echo 'CFLAGS_susfs.o += -Wno-unused-variable -Wno-unused-function -Wno-error' >> fs/Makefile
+
+          echo ">> STAGE 7: Install the OFFICIAL KernelSU-Next driver (branch: ${KSUN_BRANCH})"
+          # The official 'next' driver is susfs-AWARE and, with CONFIG_KPROBES=y, registers
+          # its su/ksud/input hooks via KPROBES at runtime -- no kernel-source hook patch
+          # needed (STAGE 5). With the susfs 50_ kernel patch (STAGE 4) + CONFIG_KSU_SUSFS=y
+          # (Step 10), its sucompat.c compiles against SUSFS v2.x. Same driver family as your
+          # installed KSU-Next v3.2.0 manager, so manager<->kernel stay aligned.
+          # NOTE: not using the 'next-susfs' branch -- a dedicated 6.6 next-susfs branch is
+          # still unsettled upstream (KernelSU-Next#1293); 'next' + susfs 50_ + kprobe hooks
+          # is the supported route for 6.6.
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/${KSUN_BRANCH}/kernel/setup.sh" | bash -s "${KSUN_BRANCH}"
+          if [ ! -e drivers/kernelsu ] && [ ! -d KernelSU-Next ]; then
+            echo ">> [FATAL] KSU-Next setup did not produce the driver"; exit 1
+          fi
+          echo ">> KSU-Next version metadata:"
+          ( cd KernelSU-Next 2>/dev/null && echo "   ref: $(git rev-parse --abbrev-ref HEAD 2>/dev/null) @ $(git rev-parse --short HEAD 2>/dev/null)" ) || true
+          echo ">> KSU-Next driver sources:"
+          ls drivers/kernelsu/*.c 2>/dev/null | sed 's/^/   /' || ls KernelSU-Next/kernel/*.c | sed 's/^/   /'
+
+          echo ">> STAGE 8: PRE-BUILD CANARY — assert SUSFS is wired (kprobe hook mode)"
+          # 8a. was: 'use of undeclared identifier SUSFS_MAX_LEN_PATHNAME'
+          grep -rqsE 'define[[:space:]]+SUSFS_MAX_LEN_PATHNAME' include/linux/ \
+            || { echo ">> [FATAL] SUSFS_MAX_LEN_PATHNAME not defined in headers"; exit 1; }
+          # 8b. In KPROBE mode we do NOT patch fs/exec.c with ksu_handle_* calls, so the old
+          #     manual-hook check is intentionally gone. Instead assert that fs/exec.c was NOT
+          #     left with dangling KSU manual-hook references (which would re-trigger the
+          #     'undefined symbol: ksu_execveat_hook' vmlinux link failure).
+          if grep -rqs 'ksu_handle_execve\|ksu_execveat_hook' fs/exec.c; then
+            echo ">> [FATAL] fs/exec.c still contains KSU manual-hook calls, but we are in"
+            echo ">>         kprobe mode -> these will be undefined at vmlinux link. A stale"
+            echo ">>         hooks patch is applied; start from a clean checkout."
+            exit 1
+          fi
+          # 8c. was: 'undeclared susfs_set_current_proc_umounted / susfs_is_current_proc_umounted'
+          grep -rqs 'susfs_set_current_proc_umounted' fs/susfs.c include/linux/ \
+            || { echo ">> [FATAL] susfs umount helpers missing (susfs4ksu version mismatch)"; exit 1; }
+          echo ">> CANARY OK: susfs headers + susfs helpers present; no dangling manual hooks."
+
+          echo ">> STAGE 9: NOT stubbing any Nothing vendor driver."
+          echo ">> Glyph Matrix / camera / fingerprint build from Nothing's defconfig untouched."
+          [ -e drivers/input/fingerprint/Makefile ] && echo ">> fingerprint dir present (preserved)" || echo ">> (no separate fingerprint dir in this tree)"
+
+      - name: 6. Sanity-check driver + SUSFS wiring before the long build
+        working-directory: workspace/msm-kernel
+        shell: bash
         run: |
-          echo "===== KSU-Next selinux.c sid/domain handling ====="
-          grep -n 'current_sid\|ksu_sid\|ksu.*sid\|sid.*ksu\|is_ksu\|u:r:' KSU/kernel/selinux/selinux.c || echo "   (none found)"
-          echo "----- selinux.c function signatures -----"
-          grep -nE '^(bool|int|void|static|long|u32|unsigned)[^=;]*\b[a-z_]+[[:space:]]*\(' KSU/kernel/selinux/selinux.c | sed 's#^#   #'
-          echo "----- selinux.h (full) -----"
-          cat KSU/kernel/selinux/selinux.h
+          set -e
+          echo ">> Verifying driver + susfs are wired in"
+          if ! ls drivers/kernelsu/*.c >/dev/null 2>&1; then
+            echo ">> [FATAL] no .c sources under drivers/kernelsu (symlink broken or empty)"
+            ls -la drivers/kernelsu || true
+            exit 1
+          fi
+          echo ">> Driver sources present:"
+          ls drivers/kernelsu/*.c | sed 's#^#   #'
+          [ -e fs/susfs.c ]                   || { echo ">> [FATAL] fs/susfs.c missing"; exit 1; }
+          ls include/linux/susfs*.h >/dev/null 2>&1 || { echo ">> [FATAL] susfs headers missing"; exit 1; }
+          grep -q 'susfs\.o'  fs/Makefile      || { echo ">> [FATAL] susfs.o not in fs/Makefile"; exit 1; }
+          grep -q 'kernelsu'  drivers/Makefile || { echo ">> [FATAL] kernelsu not in drivers/Makefile"; exit 1; }
+          echo ">> Fingerprint driver preserved:"
+          [ -e drivers/input/fingerprint/Makefile ] && head -n 3 drivers/input/fingerprint/Makefile || echo "   (no fingerprint dir in this tree)"
+          echo ">> OK: driver + SUSFS VFS present and wired; fingerprint intact."
+
+      - name: 7. Debug - dump module Makefile (ground truth)
+        working-directory: workspace/msm-kernel
+        run: |
+          echo "===== kernel/module/Makefile (numbered) ====="
+          cat -n kernel/module/Makefile || true
+          echo "===== grep gki_module ====="
+          grep -n "gki_module" kernel/module/Makefile || true
+
+      - name: 8. Protected-Exports Neutralization (POSIX-clean zero-symbol header)
+        working-directory: workspace/msm-kernel
+        shell: python
+        run: |
+          import os
+
+          print(">> Neutralize protected-export ENFORCEMENT (POSIX-clean)")
+
+          pe_file = "android/abi_gki_protected_exports_aarch64"
+          os.makedirs(os.path.dirname(pe_file), exist_ok=True)
+          if not os.path.exists(pe_file):
+              open(pe_file, "w", encoding="utf-8").close()
+
+          gen_script = "scripts/gen_gki_modules_headers.sh"
+          if os.path.exists(gen_script):
+              print(">> Neutralizing %s (POSIX-clean, dash-safe)." % gen_script)
+              content = (
+                  "#!/bin/sh\n"
+                  "out=\"$1\"\n"
+                  "if [ -z \"$out\" ]; then\n"
+                  "    exit 0\n"
+                  "fi\n"
+                  "dir=$(dirname \"$out\")\n"
+                  "mkdir -p \"$dir\"\n"
+                  "base=$(basename \"$out\")\n"
+                  ": > \"$out\"\n"
+                  "case \"$base\" in\n"
+                  "    gki_module_unprotected.h)\n"
+                  "        printf '%s\\n' '#ifndef _GKI_MODULE_UNPROTECTED_H' >> \"$out\"\n"
+                  "        printf '%s\\n' '#define _GKI_MODULE_UNPROTECTED_H' >> \"$out\"\n"
+                  "        printf '%s\\n' '#define NR_UNPROTECTED_SYMBOLS 0' >> \"$out\"\n"
+                  "        printf '%s\\n' '#define MAX_UNPROTECTED_NAME_LEN 1' >> \"$out\"\n"
+                  "        printf '%s\\n' 'static const char gki_unprotected_symbols[NR_UNPROTECTED_SYMBOLS][MAX_UNPROTECTED_NAME_LEN] = {};' >> \"$out\"\n"
+                  "        printf '%s\\n' '#endif' >> \"$out\"\n"
+                  "        ;;\n"
+                  "    *)\n"
+                  "        printf '%s\\n' '#ifndef _GKI_MODULE_PROTECTED_EXPORTS_H' >> \"$out\"\n"
+                  "        printf '%s\\n' '#define _GKI_MODULE_PROTECTED_EXPORTS_H' >> \"$out\"\n"
+                  "        printf '%s\\n' '#define NR_PROTECTED_EXPORTS_SYMBOLS 0' >> \"$out\"\n"
+                  "        printf '%s\\n' '#define MAX_PROTECTED_EXPORTS_NAME_LEN 1' >> \"$out\"\n"
+                  "        printf '%s\\n' 'static const char gki_protected_exports_symbols[NR_PROTECTED_EXPORTS_SYMBOLS][MAX_PROTECTED_EXPORTS_NAME_LEN] = {};' >> \"$out\"\n"
+                  "        printf '%s\\n' '#endif' >> \"$out\"\n"
+                  "        ;;\n"
+                  "esac\n"
+                  "exit 0\n"
+              )
+              with open(gen_script, "w", encoding="utf-8") as f:
+                  f.write(content)
+              os.chmod(gen_script, 0o755)
+          else:
+              print(">> [WARN] %s not found; header generation untouched." % gen_script)
+
+          for bzl_file in ["BUILD.bazel", "modules.bzl"]:
+              if os.path.exists(bzl_file):
+                  lines = open(bzl_file, encoding="utf-8", errors="ignore").read().splitlines()
+                  cleaned = [l for l in lines if "abi_gki_protected_exports" not in l]
+                  if len(cleaned) != len(lines):
+                      with open(bzl_file, "w", encoding="utf-8") as f:
+                          f.write("\n".join(cleaned) + "\n")
+                      print(">> Purged protected references out of: %s" % bzl_file)
+
+      - name: 9. Validate generated header script (dash + cc syntax check)
+        working-directory: workspace/msm-kernel
+        run: |
+          set -e
+          GEN="scripts/gen_gki_modules_headers.sh"
+          if [ -f "$GEN" ]; then
+            dash -n "$GEN" || { echo ">> [FATAL] $GEN not valid POSIX sh"; exit 1; }
+            tmpd=$(mktemp -d)
+            for hdr in gki_module_protected_exports.h gki_module_unprotected.h; do
+              dash "$GEN" "$tmpd/$hdr" "$PWD" /dev/null
+              echo "#include \"$tmpd/$hdr\"" > "$tmpd/probe.c"
+              echo "int main(void){return 0;}" >> "$tmpd/probe.c"
+              cc -fsyntax-only "$tmpd/probe.c" || { echo ">> [FATAL] generated $hdr does not compile"; exit 1; }
+              echo ">> $hdr: OK"
+            done
+            rm -rf "$tmpd"
+          fi
+
+      - name: 10. Inject KSU + full SUSFS v2 feature flags (kprobe hooks; APPEND-ONLY)
+        working-directory: workspace/msm-kernel
+        shell: bash
+        run: |
+          set -e
+          # APPEND-ONLY into Nothing's defconfig/fragments. We never remove or alter
+          # Nothing's existing vendor entries -> Glyph/camera/fingerprint stay intact.
+          # Unknown/removed CONFIG symbols are harmlessly dropped by olddefconfig
+          # (check_defconfig enforcement is neutralized in step 12). We use KPROBE
+          # su-hooks (KSU-Next default on GKI): no kernel-source hook patch, so the driver
+          # self-registers hooks at runtime. We do NOT set CONFIG_KSU_MANUAL_HOOK and we
+          # KEEP CONFIG_KPROBES=y -- this is the consistent pairing that links cleanly.
+          KSU_FRAG="$(mktemp)"
+          # Build the fragment with printf (each line is a single-quoted literal, so
+          # the YAML/shell indentation is NOT part of the emitted text -> the config
+          # lines land at column 0 in the file, as the kernel config parser requires).
+          {
+            printf '%s\n' '# --- KernelSU-Next core (KPROBE hook mode) ---'
+            printf '%s\n' 'CONFIG_KSU=y'
+            printf '%s\n' '# --- SUSFS v2.x features ---'
+            printf '%s\n' 'CONFIG_KSU_SUSFS=y'
+            printf '%s\n' 'CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y'
+            printf '%s\n' 'CONFIG_KSU_SUSFS_SUS_PATH=y'
+            printf '%s\n' 'CONFIG_KSU_SUSFS_SUS_MOUNT=y'
+            printf '%s\n' 'CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y'
+            printf '%s\n' 'CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y'
+            printf '%s\n' 'CONFIG_KSU_SUSFS_SUS_KSTAT=y'
+            printf '%s\n' 'CONFIG_KSU_SUSFS_TRY_UMOUNT=y'
+            printf '%s\n' 'CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y'
+            printf '%s\n' 'CONFIG_KSU_SUSFS_SPOOF_UNAME=y'
+            printf '%s\n' 'CONFIG_KSU_SUSFS_ENABLE_LOG=y'
+            printf '%s\n' 'CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y'
+            printf '%s\n' 'CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y'
+            printf '%s\n' 'CONFIG_KSU_SUSFS_OPEN_REDIRECT=y'
+            printf '%s\n' '# --- supporting symbols (kprobe hooks need these ON) ---'
+            printf '%s\n' 'CONFIG_KPROBES=y'
+            printf '%s\n' 'CONFIG_HAVE_KPROBES=y'
+            printf '%s\n' 'CONFIG_KPROBE_EVENTS=y'
+            printf '%s\n' 'CONFIG_KALLSYMS=y'
+            printf '%s\n' 'CONFIG_KALLSYMS_ALL=y'
+          } > "$KSU_FRAG"
+          while IFS= read -r f; do
+            echo ">> appending KSU/SUSFS config to: $f"
+            printf '\n' >> "$f"
+            cat "$KSU_FRAG" >> "$f"
+          done < <(find arch/arm64/configs/ -type f \( -name "*_defconfig" -o -name "*.config" -o -name "*.fragment" \))
+          rm -f "$KSU_FRAG"
+
+      - name: 11. Prepare Qualcomm Build Package Extensions
+        working-directory: workspace
+        run: |
+          mkdir -p build
+          touch build/BUILD.bazel
+          if [ -f msm-kernel/msm_kernel_extensions.bzl ]; then
+            cp msm-kernel/msm_kernel_extensions.bzl build/
+          elif [ -f msm-kernel/build/msm_kernel_extensions.bzl ]; then
+            cp msm-kernel/build/msm_kernel_extensions.bzl build/
+          else
+            echo "def define_top_level_rules(): pass" > build/msm_kernel_extensions.bzl
+            echo "def define_extras(*args, **kwargs): pass" >> build/msm_kernel_extensions.bzl
+            echo "def get_build_config_fragments(*args, **kwargs): return []" >> build/msm_kernel_extensions.bzl
+            echo "def get_dtb_list(*args, **kwargs): return []" >> build/msm_kernel_extensions.bzl
+            echo "def get_dtbo_list(*args, **kwargs): return []" >> build/msm_kernel_extensions.bzl
+            echo "def get_dtstree(*args, **kwargs): return \"\"" >> build/msm_kernel_extensions.bzl
+            echo "def get_gki_ramdisk_prebuilt_binary(*args, **kwargs): return \"\"" >> build/msm_kernel_extensions.bzl
+            echo "def get_vendor_ramdisk_binaries(*args, **kwargs): return []" >> build/msm_kernel_extensions.bzl
+            echo "def define_combined_vm_image(*args, **kwargs): pass" >> build/msm_kernel_extensions.bzl
+          fi
+
+      - name: 12. Sanitize Obsolete Parameters & Mock OEM Layers
+        working-directory: workspace
+        shell: python
+        run: |
+          import os
+          import re
+
+          def remove_attribute(content, attr_name):
+              pattern = r'\b' + attr_name + r'\s*=\s*'
+              while True:
+                  match = re.search(pattern, content)
+                  if not match:
+                      break
+                  start_idx = match.start()
+                  end_idx = match.end()
+                  bracket_count = paren_count = brace_count = 0
+                  while end_idx < len(content):
+                      char = content[end_idx]
+                      if char == '(': paren_count += 1
+                      elif char == ')': paren_count -= 1
+                      elif char == '[': bracket_count += 1
+                      elif char == ']': bracket_count -= 1
+                      elif char == '{': brace_count += 1
+                      elif char == '}': brace_count -= 1
+                      elif char == ',' and bracket_count == 0 and paren_count == 0 and brace_count == 0:
+                          end_idx += 1
+                          break
+                      elif char == '\n' and bracket_count == 0 and paren_count == 0 and brace_count == 0:
+                          break
+                      end_idx += 1
+                  content = content[:start_idx] + content[end_idx:]
+              return content
+
+          os.makedirs("nt_project", exist_ok=True)
+          with open("nt_project/BUILD.bazel", "w") as f: f.write("")
+          with open("nt_project/MODULE.bazel", "w") as f: f.write('module(name = "nt_project")\n')
+
+          symbols = {}
+
+          for root, dirs, files in os.walk("build/kernel"):
+              for file in files:
+                  if file.endswith((".sh", ".py", ".bzl", ".bsh", ".gki")):
+                      p = os.path.join(root, file)
+                      try:
+                          with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                              content = f.read()
+                          mutated = False
+                          if "check_defconfig" in content:
+                              content = re.sub(r'check_defconfig\s*\(\s*\)\s*\{', 'check_defconfig() {\n  return 0\n', content)
+                              content = content.replace('POST_DEFCONFIG_CMDS="check_defconfig"', 'POST_DEFCONFIG_CMDS=""')
+                              content = content.replace('POST_DEFCONFIG_CMDS=\\"check_defconfig\\"', 'POST_DEFCONFIG_CMDS=\\"\\"')
+                              mutated = True
+                          if "savedefconfig does not match" in content:
+                              content = content.replace("return ${RES}", "return 0")
+                              content = content.replace("return $RES", "return 0")
+                              content = content.replace("exit ${RES}", "exit 0")
+                              content = content.replace("exit $RES", "exit 0")
+                              mutated = True
+                          if mutated:
+                              print("[*] Neutralized defconfig validation in: %s" % p)
+                              with open(p, "w", encoding="utf-8") as f:
+                                  f.write(content)
+                      except Exception as e:
+                          print("File patching error: %s" % e)
+
+          for root, dirs, files in os.walk("msm-kernel"):
+              for file in files:
+                  if file.endswith(".bzl") or file in ["BUILD", "BUILD.bazel"]:
+                      fn = os.path.join(root, file)
+                      try:
+                          with open(fn, "r", encoding="utf-8", errors="ignore") as f:
+                              content = f.read()
+                          mutated = False
+                          if "gki_ramdisk_prebuilt_binary" in content:
+                              content = remove_attribute(content, "gki_ramdisk_prebuilt_binary")
+                              mutated = True
+                          if "nt_project" in content:
+                              matches = re.findall(r"load\s*\(\s*[\"\']@nt_project//:dict\.bzl[\"\']\s*,\s*([^)]+)\)", content)
+                              for match in matches:
+                                  for part in match.split(","):
+                                      part = part.strip()
+                                      if not part: continue
+                                      if "=" in part:
+                                          sym = part.split("=")[1].strip().strip('"').strip("'")
+                                      else:
+                                          sym = part.strip("\"").strip("'")
+                                      if sym:
+                                          if "module" in sym.lower() or "out" in sym.lower() or "+" in content:
+                                              symbols[sym] = "[]"
+                                          else:
+                                              symbols[sym] = '{"metroid": {}, "sun": {}, "pacman": {}, "pong": {}, "spock": {}, "default": {}}'
+                          if mutated:
+                              with open(fn, "w", encoding="utf-8") as f:
+                                  f.write(content)
+                      except Exception as e:
+                          print("[!] Error processing %s: %s" % (fn, e))
+
+          with open("nt_project/dict.bzl", "w") as f:
+              for sym, val in symbols.items():
+                  f.write("%s = %s\n" % (sym, val))
+
+      - name: 12b. Force modpost to WARN on unresolved vendor symbols (source-level, reliable)
+        working-directory: workspace/msm-kernel
+        shell: bash
+        run: |
+          set -e
+          MP="scripts/Makefile.modpost"
+          [ -f "$MP" ] || { echo ">> [FATAL] $MP not found"; exit 1; }
+          # WHY THIS EXISTS:
+          #   //msm-kernel (Qualcomm) does NOT honor Kleaf's --debug_modpost_warn, so
+          #   KBUILD_MODPOST_WARN never reached make and goodix_fp.ko's unresolved Nothing
+          #   vendor symbols (touchpanel_event_* / nt_display_event_*) stayed FATAL at
+          #   modpost. ACK 6.6's scripts/Makefile.modpost honors KBUILD_MODPOST_WARN via
+          #   '$(if $(KBUILD_MODPOST_WARN),-w)', so setting it directly in the file that
+          #   runs INSIDE the sandbox guarantees modpost gets '-w' (LOG_WARN instead of
+          #   LOG_ERROR for unresolved symbols). Those symbols resolve at module-LOAD time
+          #   on-device (touchpanel + display drivers are always present), and AnyKernel3
+          #   flashes only Image, so the device keeps its working stock vendor modules.
+          #
+          # IMPORTANT: check for the '-w' HOOK *before* we inject our own line (otherwise
+          # our injected 'KBUILD_MODPOST_WARN := 1' would make the check trivially pass).
+          if grep -qE 'KBUILD_MODPOST_WARN.*-w' "$MP"; then
+            grep -q '^KBUILD_MODPOST_WARN := 1' "$MP" || sed -i '1i KBUILD_MODPOST_WARN := 1' "$MP"
+            echo ">> Standard -w hook present; set 'KBUILD_MODPOST_WARN := 1' at top of $MP."
+          else
+            echo ">> [FATAL] $MP does not contain the '\$(if \$(KBUILD_MODPOST_WARN),-w)' hook."
+            echo ">>         This tree wires modpost differently. Inspect $MP and add -w to"
+            echo ">>         the modpost-args / MODPOST invocation manually, then re-run."
+            echo ">>         Current modpost wiring for reference:"
+            grep -nE 'modpost-args|MODPOST|scripts/mod/modpost' "$MP" | sed 's/^/   /' || true
+            exit 1
+          fi
+          echo ">> Verifying modpost warn wiring:"
+          grep -nE 'KBUILD_MODPOST_WARN|modpost-args' "$MP" | head -20 || true
+
+      - name: 13. Compile the Kernel via Qualcomm Kleaf
+        working-directory: workspace
+        run: |
+          echo ">> Commencing Kernel Compilation via Qualcomm Bazel..."
+          # --lto=thin keeps peak RAM/time down on the GitHub runner; drop it for full LTO.
+          # --debug_modpost_warn is kept as belt-and-suspenders (helps any //common-side
+          # modpost pass) but the RELIABLE fix for the goodix_fp.ko vendor-symbol modpost
+          # failure is Step 12b, which patches scripts/Makefile.modpost directly because
+          # //msm-kernel does not propagate this Kleaf flag into its make invocation.
+          tools/bazel run //msm-kernel:kernel_aarch64_dist --lto=thin --debug_modpost_warn -- --dist_dir=out_dist
+
+      - name: 14. Show dist output + verify vendor module set
+        working-directory: workspace
+        run: |
+          echo ">> Contents of out_dist:"
+          ls -la out_dist || true
+          # Qualcomm's kernel_aarch64_dist emits Image / Image.gz (+ dtbs). It may
+          # NOT emit a ready boot.img. If boot.img is absent, package Image with
+          # AnyKernel3 (see the chat notes) - that is the format you actually flash.
+
+          echo ""
+          echo ">> Sanity: did the fingerprint module and its symbol PROVIDERS build?"
+          echo ">> (We used --debug_modpost_warn, so undefined symbols were warnings."
+          echo ">>  These providers MUST exist as modules or be built-in, or FP won't"
+          echo ">>  resolve at load time on-device.)"
+          # Search the whole bazel output + dist for the relevant .ko's.
+          find out_dist out -name '*.ko' 2>/dev/null | grep -Ei 'goodix_fp|fingerprint|touch|nt_display|display' | sort -u | sed 's/^/   module: /' || true
+          echo ">> If 'goodix_fp.ko' appears but NO touchpanel/display provider .ko appears,"
+          echo ">> the providers are either built-in (fine) or missing (FP will fail to load)."
+          echo ">> Confirm with: grep -E 'CONFIG_.*(TOUCH|TOUCHPANEL|NT_DISPLAY|PANEL_NOTIFIER)' on the resolved .config."
+
+      - name: 15. Upload kernel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nos4.1-metroid-ksunext-susfs2.1.0
+          path: |
+            workspace/out_dist/Image
+            workspace/out_dist/Image.gz
+            workspace/out_dist/boot.img
+          if-no-files-found: warn
+          compression-level: 9
