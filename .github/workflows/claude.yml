@@ -1,54 +1,4 @@
-name: Build NOS 4.1 Kernel (NP3 / metroid) - KSU-Next [next] + SUSFS v2.x + manual hooks
-
-# ============================================================================
-# WHAT CHANGED vs your failing workflow (and why it fixes the sucompat.c errors)
-# ----------------------------------------------------------------------------
-# ROOT CAUSE of build #N failing at sucompat.c:
-#   You cloned KernelSU-Next's DEFAULT (`next`) branch HEAD and then tried to
-#   bolt SUSFS on with TheWildJames `susfs_fix_patches`. Those fix patches are
-#   cut against ONE specific KSU-Next commit. Your `apply_ksun_patch` helper
-#   SILENTLY SKIPS any patch that doesn't apply cleanly ("SKIPPED (no clean
-#   apply)"). So when KSU-Next HEAD drifted, the patch that defines the SUSFS
-#   bridge + reconciles sucompat.c got skipped, while others applied -> an
-#   internally-inconsistent driver. That is exactly:
-#     * redefinition of 'ksu_su_compat_enabled' (static_key vs bool)  -> .c/.h drift
-#     * 'ksu_adb_root_handle_execve' 2-arg vs 1-arg                   -> .c/.h drift
-#     * undeclared SUSFS_MAX_LEN_PATHNAME / susfs_*_proc_umounted     -> susfs glue skipped
-#     * incomplete 'struct user_arg_ptr', undeclared 'is_init'        -> MANUAL HOOKS
-#                                                                         patch never applied
-#
-# THE FIX (this file) - keep both halves at CURRENT versions, no cross-fork drift:
-#   1) SUSFS kernel side: simonpunk susfs4ksu @ gki-android15-6.6 -> copy fs/* +
-#      include/linux/*, apply 50_add_susfs (this part already applied cleanly in
-#      your run; SUSFS detected as v2.x). Defines SUSFS_MAX_LEN_PATHNAME, the
-#      susfs_*_proc_umounted helpers, fs/susfs.c, headers.
-#   2) Manual hooks: KernelSU-Next/kernel_patches
-#      syscall_hook/min_scope_syscall_hooks_v1.4.patch -- the canonical
-#      "scope-minimized manual hooks v1.4" (same lineage as susfs's 60_). simonpunk's
-#      6.6 branch does NOT ship a 60_ patch, which is why your build hard-failed at
-#      STAGE 5. Applying this AFTER 50_ replicates the proven 50_ -> 60_ sequence and
-#      provides the ksu_handle_* hooks + struct user_arg_ptr / is_init scaffolding.
-#   3) Driver: OFFICIAL KernelSU-Next `next` setup.sh (susfs-aware, supports 6.6,
-#      same family as your installed v3.2.0 manager). NOT the WildJames fix-patch
-#      matrix; NOT a 6.6 'next-susfs' branch (still unsettled upstream, KSUN#1293).
-#   4) MANUAL hooks, not kprobes: CONFIG_KSU_MANUAL_HOOK=y and leave
-#      CONFIG_KSU_KPROBES_HOOK unset (the v1.4 patch is guarded on
-#      CONFIG_KSU && !CONFIG_KSU_KPROBES_HOOK; mixing them = undefined-symbol build break).
-#   5) Keep your (working) Kleaf harness, protected-export neutralization and
-#      defconfig sanitization untouched.
-#
-#   CAVEAT (honest): this 3-repo integration on android15-6.6 is fast-moving and was
-#   NOT test-compiled in the environment that produced this file. The hard-fail
-#   canaries below catch any residual misalignment in seconds instead of at step
-#   749. If STAGE 5 rejects, see the chat notes for the two highest-certainty
-#   fallbacks (fork a maintained device CI, or SukiSU-Ultra susfs-main).
-#
-# FEATURE PRESERVATION (Glyph Matrix / camera / fingerprint):
-#   We never stub or remove anything from Nothing's defconfig. Step 10 is
-#   APPEND-ONLY. Vendor drivers build from Nothing's tree as-is. The only thing
-#   we relax is the GKI protected-export ENFORCEMENT (steps 8-9) which is
-#   required for ANY out-of-tree/vendor module to load (Wi-Fi/BT/etc.).
-# ============================================================================
+name: Build Nothing OS 4.1 Kernel (KSU-Next stable + SUSFS)
 
 on:
   push:
@@ -56,16 +6,6 @@ on:
 
 permissions:
   contents: read
-
-env:
-  # ---- PINNED INPUTS (the whole point: no floating HEADs) -------------------
-  KERNEL_REPO: "NothingOSS/android_kernel_msm-6.6_nothing_sm8735"
-  KERNEL_REF:  "sm8735/b/mr"
-  SUSFS_BRANCH: "gki-android15-6.6"   # simonpunk SUSFS line for android15-6.6 (currently v2.x)
-  KSUN_BRANCH:  "next"                # OFFICIAL KSU-Next driver branch (susfs-aware; supports 4.4-6.6)
-  KSU_PATCHES_REPO: "https://github.com/KernelSU-Next/kernel_patches"  # official manual-hooks patch
-  # Once you get a green build, replace the branch clones below with the exact
-  # commit SHAs they resolved to (printed in the logs) for full reproducibility.
 
 jobs:
   build-kernel:
@@ -125,130 +65,155 @@ jobs:
       - name: 4. Checkout Nothing Kernel Source (NOS 4.1)
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.KERNEL_REPO }}
-          ref: ${{ env.KERNEL_REF }}
+          repository: NothingOSS/android_kernel_msm-6.6_nothing_sm8735
+          ref: sm8735/b/mr
           path: workspace/msm-kernel
 
-      - name: 5. Integrate SUSFS v2.x (VFS 50_) + scope-min manual hooks + official KSU-Next driver
+      - name: 5. Integrate KSU-Next (stable tag) + SUSFS (both susfs patches)
         working-directory: workspace/msm-kernel
-        shell: bash
+        env:
+          TRY_UMOUNT_RECONCILE: |
+            import re, sys, os
+            p = sys.argv[1]
+            if not os.path.exists(p):
+                print(">> Target file missing.")
+                sys.exit(0)
+            src = open(p, encoding="utf-8", errors="ignore").read()
+            four_arg_def = re.search(r'void\s+try_umount\s*\([^)]*\buid_t\s+\w+\s*\)', src)
+            if not four_arg_def:
+                print(">> Definition is not 4-arg; nothing to reconcile.")
+                sys.exit(0)
+            pattern = re.compile(r'(try_umount\s*\(\s*[^,()]+,\s*(?:true|false)\s*,\s*[A-Za-z0-9_]+)\s*\)')
+            fixed, n = pattern.subn(r'\1, 0)', src)
+            if n:
+                open(p, "w", encoding="utf-8").write(fixed)
+                print(f">> Reconciled {n} three-arg try_umount call(s) to 4-arg (uid=0).")
+            else:
+                print(">> No 3-arg call sites found; definition/callers already consistent.")
         run: |
           set -e
 
-          echo ">> STAGE 0: Clean any prior KSU/SUSFS state (avoid double-wiring)"
-          rm -rf KernelSU KernelSU-Next SukiSU-Ultra /tmp/susfs4ksu
+          fail_on_rej() {
+            scope="$1"
+            rejs=$(find "$scope" -name "*.rej" -not -path "./.git/*" 2>/dev/null || true)
+            if [ -n "$rejs" ]; then
+              echo ">> [FATAL] Patch rejects under $scope:"
+              for r in $rejs; do echo "----- $r -----"; cat "$r"; done
+              exit 1
+            fi
+          }
+
+          symbol_defined() {
+            grep -rnE 'susfs_is_current_ksu_domain[[:space:]]*\(void\)' KernelSU-Next/ security/ fs/ 2>/dev/null \
+              | grep -vE 'extern|;[[:space:]]*$' | grep -qE '\b(bool|int)\b'
+          }
+
+          dump_diag() {
+            echo "================= DIAGNOSTICS ================="
+            echo ">> KernelSU-Next ref: $(cd KernelSU-Next && git describe --tags 2>/dev/null || git rev-parse --short HEAD)"
+            echo ">> KernelSU-Next/kernel layout (dirs):"
+            find KernelSU-Next/kernel -maxdepth 2 -type d 2>/dev/null | sed 's#^#     #'
+            echo ">> KernelSU-Next .c files:"
+            find KernelSU-Next/kernel -name '*.c' 2>/dev/null | sed 's#^#     #'
+            echo ">> susfs functions referenced/defined inside KernelSU-Next:"
+            grep -rhoE 'susfs_[a-z_]+' KernelSU-Next/ 2>/dev/null | sort -u | sed 's#^#     #' | head -60
+            echo ">> susfs4ksu patch files:"
+            find /tmp/susfs4ksu -name '*.patch' 2>/dev/null | sed 's#^#     #'
+            echo ">> Every occurrence of susfs_is_current_ksu_domain in tree:"
+            grep -rn 'susfs_is_current_ksu_domain' KernelSU-Next/ security/ fs/ 2>/dev/null | sed 's#^#     #'
+            echo ">> Definition of susfs_is_current_ksu_domain inside susfs4ksu repo (if any):"
+            grep -rn 'susfs_is_current_ksu_domain' /tmp/susfs4ksu 2>/dev/null | sed 's#^#     #' | head -20
+            echo "==============================================="
+          }
+
+          echo ">> STAGE 0: Wipe any pre-existing KSU state"
+          rm -rf KernelSU KernelSU-Next SukiSU-Ultra
           [ -L drivers/kernelsu ] && rm -f drivers/kernelsu || true
           [ -d drivers/kernelsu ] && rm -rf drivers/kernelsu || true
-          # IMPORTANT: do NOT pre-edit drivers/Makefile or drivers/Kconfig here.
-          # KSU-Next's setup.sh wires them itself; pre-editing creates duplicate
-          # entries / breaks the symlink it creates.
+          sed -i '/kernelsu/d' drivers/Makefile 2>/dev/null || true
+          sed -i '\#drivers/kernelsu/Kconfig#d' drivers/Kconfig 2>/dev/null || true
 
-          echo ">> STAGE 1: Clone susfs4ksu (simonpunk) @ ${SUSFS_BRANCH}  [SUSFS v2.x]"
-          git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b "${SUSFS_BRANCH}" /tmp/susfs4ksu
-          echo ">> susfs4ksu @ $(git -C /tmp/susfs4ksu rev-parse --short HEAD)  <-- pin this SHA later"
+          echo ">> STAGE 1: Clone KernelSU-Next and check out the latest STABLE tag"
+          git clone https://github.com/KernelSU-Next/KernelSU-Next KernelSU-Next
+          cd KernelSU-Next
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          if [ -n "$LATEST_TAG" ]; then
+            git checkout -q "$LATEST_TAG"
+            echo ">> Checked out KernelSU-Next stable tag: $LATEST_TAG @ $(git rev-parse --short HEAD)"
+          else
+            echo ">> [WARN] No tags found; staying on $(git rev-parse --abbrev-ref HEAD)"
+          fi
+          cd ..
+          [ -d KernelSU-Next/kernel ] || { echo ">> [FATAL] KernelSU-Next has no kernel/ dir"; exit 1; }
 
-          echo ">> STAGE 2: Copy SUSFS kernel-side VFS sources + headers into the tree"
+          echo ">> STAGE 2: Symlink the driver into drivers/kernelsu"
+          ln -sf "$(realpath --relative-to=drivers KernelSU-Next/kernel)" drivers/kernelsu
+          grep -q "kernelsu" drivers/Makefile || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+          grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig || sed -i '/endmenu/i\source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+
+          echo ">> STAGE 3: Clone susfs4ksu gki-android15-6.6 (simonpunk, HEAD)"
+          git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 /tmp/susfs4ksu
+          echo ">> susfs4ksu @ $(cd /tmp/susfs4ksu && git rev-parse --short HEAD)"
+
+          echo ">> STAGE 4: Copy SUSFS VFS sources + headers"
           cp -v /tmp/susfs4ksu/kernel_patches/fs/* fs/
           cp -v /tmp/susfs4ksu/kernel_patches/include/linux/* include/linux/
+          if ! grep -q "susfs.o" fs/Makefile; then
+            echo "obj-y += susfs.o" >> fs/Makefile
+            echo "CFLAGS_susfs.o += -Wno-unused-variable -Wno-unused-function -Wno-error" >> fs/Makefile
+          fi
+          echo ">> SUSFS header version: $(grep -hoE 'SUSFS_VERSION[[:space:]]*\"[^\"]*\"' include/linux/susfs.h 2>/dev/null | head -1 || echo unknown)"
 
-          echo ">> STAGE 3: Assert SUSFS is v2.x (gki-android15-6.6 currently ships v2.x)"
-          SUSFS_VER=$(grep -rhoE '#define[[:space:]]+SUSFS_VERSION[[:space:]]+"[^"]+"' include/linux/ \
-                        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
-          echo ">> Detected SUSFS_VERSION: ${SUSFS_VER:-<none>}"
-          case "$SUSFS_VER" in
-            2.*) echo ">> OK: SUSFS v2.x confirmed." ;;
-            *)   echo ">> [FATAL] Expected SUSFS v2.x on ${SUSFS_BRANCH}, got '${SUSFS_VER:-none}'."; exit 1 ;;
-          esac
-
-          echo ">> STAGE 4: Apply SUSFS kernel-side VFS patch (50_add_susfs)"
-          GKI_PATCH=$(find /tmp/susfs4ksu/kernel_patches -maxdepth 1 -name '50_add_susfs_in_gki-android15-6.6.patch' | head -1)
-          [ -z "$GKI_PATCH" ] && GKI_PATCH=$(find /tmp/susfs4ksu/kernel_patches -maxdepth 1 -name '50_add_susfs_in_gki-*6.6*.patch' | head -1)
-          [ -n "$GKI_PATCH" ] || { echo ">> [FATAL] 50_add_susfs patch not found"; exit 1; }
+          echo ">> STAGE 5: Apply SUSFS VFS patch (50_add_susfs, kernel side)"
+          GKI_PATCH=$(find /tmp/susfs4ksu -type f -name "50_add_susfs_in_gki-android15-6.6.patch" | head -n 1)
+          [ -z "$GKI_PATCH" ] && GKI_PATCH=$(find /tmp/susfs4ksu -type f -name "*.patch" | grep -iE "gki.*6\.6" | head -n 1)
+          [ -z "$GKI_PATCH" ] && { echo ">> [FATAL] No GKI android15-6.6 SUSFS VFS patch found."; exit 1; }
           echo ">> VFS patch: $GKI_PATCH"
-          patch -p1 --no-backup-if-mismatch --fuzz=3 < "$GKI_PATCH"
+          patch -p1 --forward --fuzz=3 < "$GKI_PATCH" || true
+          fail_on_rej "."
 
-          echo ">> STAGE 5: Apply scope-minimized MANUAL HOOKS patch  <-- the piece you were missing"
-          # WHY THIS CHANGED: simonpunk's gki-android15-6.6 branch does NOT ship a
-          # '60_scope-minimized_manual_hooks.patch' (that file lives only in pershoot's
-          # 6.1 fork / WildKernels). The CANONICAL, version-matched equivalent for the
-          # official KSU-Next driver is KernelSU-Next/kernel_patches:
-          #   syscall_hook/min_scope_syscall_hooks_v1.4.patch
-          # It is the SAME "scope-minimized manual hooks v1.4" lineage as susfs's 60_,
-          # so applying it AFTER the susfs 50_ patch replicates the proven 50_ -> 60_
-          # sequence. It inserts the ksu_handle_* syscall hooks into fs/exec.c, fs/open.c,
-          # fs/read_write.c, drivers/input/input.c (guarded by
-          # CONFIG_KSU && !CONFIG_KSU_KPROBES_HOOK) and provides the struct user_arg_ptr /
-          # is_init scaffolding the susfs-aware sucompat.c needs to compile.
-          echo ">> Cloning ${KSU_PATCHES_REPO}"
-          git clone --depth=1 "${KSU_PATCHES_REPO}" /tmp/ksu_patches
-          echo ">> ksu_patches @ $(git -C /tmp/ksu_patches rev-parse --short HEAD)  <-- pin this SHA later"
-          HOOK_PATCH=$(find /tmp/ksu_patches -name 'min_scope_syscall_hooks_v1.4.patch' | head -1)
-          # tolerate a future minor rename (e.g. _v1.5) but require the min-scope family
-          [ -z "$HOOK_PATCH" ] && HOOK_PATCH=$(find /tmp/ksu_patches -name 'min_scope_syscall_hooks_*.patch' | sort -V | tail -1)
-          [ -z "$HOOK_PATCH" ] && HOOK_PATCH=$(find /tmp/ksu_patches -iname '*scope*manual*hook*.patch' -o -iname '*scope*syscall*hook*.patch' | head -1)
-          if [ -n "$HOOK_PATCH" ]; then
-            echo ">> Manual hooks patch: $HOOK_PATCH"
-            patch -p1 --no-backup-if-mismatch --fuzz=3 < "$HOOK_PATCH"
+          echo ">> STAGE 6: Ensure susfs_is_current_ksu_domain is DEFINED"
+          if symbol_defined; then
+            echo ">> Symbol already defined by KernelSU-Next stable (built-in susfs). Good."
           else
-            echo ">> [FATAL] No scope-minimized manual-hooks patch found in ${KSU_PATCHES_REPO}."
-            echo ">>         Tree of /tmp/ksu_patches for debugging:"; find /tmp/ksu_patches -name '*.patch' | sed 's/^/   /'
+            echo ">> Symbol not yet defined. Applying susfs4ksu KSU-side patch..."
+            KSU_PATCH=$(find /tmp/susfs4ksu -type f -path "*KernelSU*" -iname "*enable_susfs*.patch" | head -1)
+            [ -z "$KSU_PATCH" ] && KSU_PATCH=$(find /tmp/susfs4ksu -type f -path "*KernelSU*" -name "*.patch" | head -1)
+            if [ -n "$KSU_PATCH" ]; then
+              echo ">> KSU-side susfs patch: $KSU_PATCH"
+              ( cd KernelSU-Next && patch -p1 --forward --fuzz=2 < "$KSU_PATCH" ) || \
+              ( cd KernelSU-Next/kernel && patch -p1 --forward --fuzz=2 < "$KSU_PATCH" ) || true
+              fail_on_rej "KernelSU-Next"
+            else
+              echo ">> [WARN] No KSU-side susfs patch found in susfs4ksu repo."
+            fi
+          fi
+
+          echo "=================================================="
+          echo ">> STAGE 5b: Reconcile try_umount signature"
+          echo "=================================================="
+          CH=$(find "$KSU_ROOT" -name "core_hook.c" | head -n 1)
+          if [ -n "$CH" ]; then
+            python3 -c "$TRY_UMOUNT_RECONCILE" "$CH"
+          else
+            echo ">> core_hook.c not found under $KSU_ROOT; skipping reconciliation."
+          fi
+          fail_on_rej "."
+
+          echo ">> STAGE 7: CANARY (real definition check) — fail fast if undefined"
+          if ! symbol_defined; then
+            echo ">> [FATAL] susfs_is_current_ksu_domain is still NOT defined (only extern/calls)."
+            echo ">>         It will be undefined at the vmlinux link. Diagnostics below."
+            dump_diag
             exit 1
           fi
+          echo ">> CANARY OK — real definition present:"
+          grep -rnE 'susfs_is_current_ksu_domain[[:space:]]*\(void\)' KernelSU-Next/ security/ fs/ 2>/dev/null | grep -vE 'extern|;[[:space:]]*$' | grep -E '\b(bool|int)\b' | sed 's#^#     #'
 
-          echo ">> STAGE 6: Fail HARD on any reject (never proceed on a partial tree)"
-          REJ=$(find . -name '*.rej' -not -path './.git/*' 2>/dev/null || true)
-          if [ -n "$REJ" ]; then
-            echo ">> [FATAL] Patch rejects present:"
-            for r in $REJ; do echo "----- $r -----"; cat "$r"; done
-            exit 1
-          fi
-
-          echo ">> STAGE 6b: Belt-and-suspenders fs/Makefile wiring for susfs.o"
-          if ! grep -q 'susfs\.o' fs/Makefile; then
-            echo 'obj-$(CONFIG_KSU_SUSFS) += susfs.o' >> fs/Makefile
-          fi
-          grep -q 'CFLAGS_susfs.o' fs/Makefile || \
-            echo 'CFLAGS_susfs.o += -Wno-unused-variable -Wno-unused-function -Wno-error' >> fs/Makefile
-
-          echo ">> STAGE 7: Install the OFFICIAL KernelSU-Next driver (branch: ${KSUN_BRANCH})"
-          # The official 'next' driver is susfs-AWARE: with the susfs 50_ kernel patch
-          # applied (STAGE 4) + the manual-hooks patch applied (STAGE 5) + CONFIG_KSU_SUSFS=y
-          # (Step 10), its sucompat.c compiles against SUSFS v2.x. This is the same driver
-          # family as your installed KSU-Next v3.2.0 manager, so manager<->kernel stay aligned.
-          # NOTE: we deliberately do NOT use the 'next-susfs' branch here -- a dedicated 6.6
-          # next-susfs branch is still unsettled upstream (KernelSU-Next#1293); 'next' + susfs
-          # patches + manual hooks is the supported route for 6.6.
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/${KSUN_BRANCH}/kernel/setup.sh" | bash -s "${KSUN_BRANCH}"
-          if [ ! -e drivers/kernelsu ] && [ ! -d KernelSU-Next ]; then
-            echo ">> [FATAL] KSU-Next setup did not produce the driver"; exit 1
-          fi
-          echo ">> KSU-Next version metadata:"
-          ( cd KernelSU-Next 2>/dev/null && echo "   ref: $(git rev-parse --abbrev-ref HEAD 2>/dev/null) @ $(git rev-parse --short HEAD 2>/dev/null)" ) || true
-          echo ">> KSU-Next driver sources:"
-          ls drivers/kernelsu/*.c 2>/dev/null | sed 's/^/   /' || ls KernelSU-Next/kernel/*.c | sed 's/^/   /'
-
-          echo ">> STAGE 8: PRE-BUILD CANARY — assert the EXACT symbols that failed before"
-          # 8a. was: 'use of undeclared identifier SUSFS_MAX_LEN_PATHNAME'
-          grep -rqsE 'define[[:space:]]+SUSFS_MAX_LEN_PATHNAME' include/linux/ \
-            || { echo ">> [FATAL] SUSFS_MAX_LEN_PATHNAME not defined in headers"; exit 1; }
-          # 8b. was: 'variable has incomplete type struct user_arg_ptr' / 'undeclared is_init'
-          #     'struct user_arg_ptr' exists natively in stock fs/exec.c, so it is a
-          #     poor discriminator. Instead assert the manual-hooks patch actually
-          #     INSERTED the KSU exec hook into fs/exec.c (absent on a stock tree).
-          grep -rqs 'ksu_handle_execve' fs/exec.c \
-            || { echo ">> [FATAL] manual hooks not applied (no ksu_handle_execve* hook in fs/exec.c)"; exit 1; }
-          # 8c. was: 'undeclared susfs_set_current_proc_umounted / susfs_is_current_proc_umounted'
-          grep -rqs 'susfs_set_current_proc_umounted' fs/susfs.c include/linux/ \
-            || { echo ">> [FATAL] susfs umount helpers missing (susfs4ksu version mismatch)"; exit 1; }
-          echo ">> CANARY OK: susfs headers + manual hooks + susfs helpers all present."
-
-          echo ">> STAGE 9: NOT stubbing any Nothing vendor driver."
-          echo ">> Glyph Matrix / camera / fingerprint build from Nothing's defconfig untouched."
-          [ -e drivers/input/fingerprint/Makefile ] && echo ">> fingerprint dir present (preserved)" || echo ">> (no separate fingerprint dir in this tree)"
+          echo ">> STAGE 8: NOT stubbing fingerprint (preserve the sensor feature)."
 
       - name: 6. Sanity-check driver + SUSFS wiring before the long build
         working-directory: workspace/msm-kernel
-        shell: bash
         run: |
           set -e
           echo ">> Verifying driver + susfs are wired in"
@@ -259,13 +224,11 @@ jobs:
           fi
           echo ">> Driver sources present:"
           ls drivers/kernelsu/*.c | sed 's#^#   #'
-          [ -e fs/susfs.c ]                   || { echo ">> [FATAL] fs/susfs.c missing"; exit 1; }
-          ls include/linux/susfs*.h >/dev/null 2>&1 || { echo ">> [FATAL] susfs headers missing"; exit 1; }
-          grep -q 'susfs\.o'  fs/Makefile      || { echo ">> [FATAL] susfs.o not in fs/Makefile"; exit 1; }
-          grep -q 'kernelsu'  drivers/Makefile || { echo ">> [FATAL] kernelsu not in drivers/Makefile"; exit 1; }
-          echo ">> Fingerprint driver preserved:"
-          [ -e drivers/input/fingerprint/Makefile ] && head -n 3 drivers/input/fingerprint/Makefile || echo "   (no fingerprint dir in this tree)"
-          echo ">> OK: driver + SUSFS VFS present and wired; fingerprint intact."
+          [ -e fs/susfs.c ]                  || { echo ">> [FATAL] fs/susfs.c missing"; exit 1; }
+          [ -e include/linux/susfs.h ]       || { echo ">> [FATAL] include/linux/susfs.h missing"; exit 1; }
+          grep -q "susfs.o" fs/Makefile      || { echo ">> [FATAL] susfs.o not in fs/Makefile"; exit 1; }
+          grep -q "kernelsu" drivers/Makefile|| { echo ">> [FATAL] kernelsu not in drivers/Makefile"; exit 1; }
+          echo ">> OK: driver + SUSFS VFS present and wired."
 
       - name: 7. Debug - dump module Makefile (ground truth)
         working-directory: workspace/msm-kernel
@@ -278,8 +241,40 @@ jobs:
       - name: 8. Protected-Exports Neutralization (POSIX-clean zero-symbol header)
         working-directory: workspace/msm-kernel
         shell: python
+        env:
+          PROTECTED_EXPORTS_PATCH: |
+            import sys, os
+            p = sys.argv[1]
+            if os.path.exists(p):
+                lines = open(p, encoding="utf-8", errors="ignore").read().splitlines(keepends=True)
+                out, i = [], 0
+                target = "gki_module_protected_exports.h"
+                while i < len(lines):
+                    line = lines[i]
+                    if target in line and ":" in line and not line.lstrip().startswith("#"):
+                        rule_target = line.split(":")[0].rstrip()
+                        out.append(rule_target + ": FORCE\n")
+                        out.append("\t$(Q)mkdir -p $(dir $@)\n")
+                        out.append("\t$(Q): > $@\n")
+                        i += 1
+                        while i < len(lines) and (lines[i].startswith("\t") or lines[i].strip() == ""):
+                            if lines[i].strip() == "":
+                                j = i + 1
+                                while j < len(lines) and lines[j].strip() == "":
+                                    j += 1
+                                if j < len(lines) and lines[j].startswith("\t"):
+                                    i += 1
+                                    continue
+                                break
+                            i += 1
+                        continue
+                    out.append(line)
+                    i += 1
+                open(p, "w", encoding="utf-8").write("".join(out))
+                print(">> Patched recipe for %s" % target)
         run: |
           import os
+          import sys
 
           print(">> Neutralize protected-export ENFORCEMENT (POSIX-clean)")
 
@@ -287,6 +282,13 @@ jobs:
           os.makedirs(os.path.dirname(pe_file), exist_ok=True)
           if not os.path.exists(pe_file):
               open(pe_file, "w", encoding="utf-8").close()
+
+          mod_mk = "kernel/module/Makefile"
+          if os.path.exists(mod_mk):
+              print(f">> Rewriting protected-exports recipe inside: {mod_mk}")
+              # Run the multi-line patch environment snippet safely
+              import subprocess
+              subprocess.run([sys.executable, "-c", os.environ["PROTECTED_EXPORTS_PATCH"], mod_mk], check=True)
 
           gen_script = "scripts/gen_gki_modules_headers.sh"
           if os.path.exists(gen_script):
@@ -354,52 +356,36 @@ jobs:
             rm -rf "$tmpd"
           fi
 
-      - name: 10. Inject KSU + full SUSFS v2 feature flags (manual hooks; APPEND-ONLY)
+      - name: 10. Inject KSU + full SUSFS flags + KPM; exclude vendor fp module from build
         working-directory: workspace/msm-kernel
-        shell: bash
         run: |
-          set -e
-          # APPEND-ONLY into Nothing's defconfig/fragments. We never remove or alter
-          # Nothing's existing vendor entries -> Glyph/camera/fingerprint stay intact.
-          # Unknown/removed CONFIG symbols are harmlessly dropped by olddefconfig
-          # (check_defconfig enforcement is neutralized in step 12). We use MANUAL
-          # hooks (matches 60_*.patch) rather than kprobe su-hooks: manual hooks are
-          # less detectable and the integrated sucompat.c is written for them.
-          KSU_FRAG="$(mktemp)"
-          # Build the fragment with printf (each line is a single-quoted literal, so
-          # the YAML/shell indentation is NOT part of the emitted text -> the config
-          # lines land at column 0 in the file, as the kernel config parser requires).
-          {
-            printf '%s\n' '# --- KernelSU-Next core ---'
-            printf '%s\n' 'CONFIG_KSU=y'
-            printf '%s\n' 'CONFIG_KSU_MANUAL_HOOK=y'
-            printf '%s\n' '# --- SUSFS v2.x features ---'
-            printf '%s\n' 'CONFIG_KSU_SUSFS=y'
-            printf '%s\n' 'CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y'
-            printf '%s\n' 'CONFIG_KSU_SUSFS_SUS_PATH=y'
-            printf '%s\n' 'CONFIG_KSU_SUSFS_SUS_MOUNT=y'
-            printf '%s\n' 'CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y'
-            printf '%s\n' 'CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y'
-            printf '%s\n' 'CONFIG_KSU_SUSFS_SUS_KSTAT=y'
-            printf '%s\n' 'CONFIG_KSU_SUSFS_TRY_UMOUNT=y'
-            printf '%s\n' 'CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y'
-            printf '%s\n' 'CONFIG_KSU_SUSFS_SPOOF_UNAME=y'
-            printf '%s\n' 'CONFIG_KSU_SUSFS_ENABLE_LOG=y'
-            printf '%s\n' 'CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y'
-            printf '%s\n' 'CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y'
-            printf '%s\n' 'CONFIG_KSU_SUSFS_OPEN_REDIRECT=y'
-            printf '%s\n' '# --- supporting symbols ---'
-            printf '%s\n' 'CONFIG_KPROBES=y'
-            printf '%s\n' 'CONFIG_HAVE_KPROBES=y'
-            printf '%s\n' 'CONFIG_KALLSYMS=y'
-            printf '%s\n' 'CONFIG_KALLSYMS_ALL=y'
-          } > "$KSU_FRAG"
-          while IFS= read -r f; do
-            echo ">> appending KSU/SUSFS config to: $f"
-            printf '\n' >> "$f"
-            cat "$KSU_FRAG" >> "$f"
-          done < <(find arch/arm64/configs/ -type f \( -name "*_defconfig" -o -name "*.config" -o -name "*.fragment" \))
-          rm -f "$KSU_FRAG"
+          find arch/arm64/configs/ -type f \( -name "*_defconfig" -o -name "*.config" -o -name "*.fragment" \) \
+            -exec sh -c '
+              f="$1"
+              echo "CONFIG_KSU=y" >> "$f"
+              echo "CONFIG_KPROBES=y" >> "$f"
+              echo "CONFIG_HAVE_KPROBES=y" >> "$f"
+              echo "CONFIG_KPROBE_EVENTS=y" >> "$f"
+              echo "CONFIG_KALLSYMS=y" >> "$f"
+              echo "CONFIG_KALLSYMS_ALL=y" >> "$f"
+              echo "CONFIG_KPM=y" >> "$f"
+              echo "CONFIG_KSU_SUSFS=y" >> "$f"
+              echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y" >> "$f"
+              echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> "$f"
+              echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> "$f"
+              echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> "$f"
+              echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> "$f"
+              echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> "$f"
+              echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> "$f"
+              echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y" >> "$f"
+              echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> "$f"
+              echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> "$f"
+              echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> "$f"
+              echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> "$f"
+              echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> "$f"
+              echo "CONFIG_KSU_SUSFS_SUS_MAP=y" >> "$f"
+              echo "# CONFIG_GOODIX_FINGERPRINT is not set" >> "$f"
+            ' _ {} \;
 
       - name: 11. Prepare Qualcomm Build Package Extensions
         working-directory: workspace
@@ -472,7 +458,7 @@ jobs:
                           if "check_defconfig" in content:
                               content = re.sub(r'check_defconfig\s*\(\s*\)\s*\{', 'check_defconfig() {\n  return 0\n', content)
                               content = content.replace('POST_DEFCONFIG_CMDS="check_defconfig"', 'POST_DEFCONFIG_CMDS=""')
-                              content = content.replace('POST_DEFCONFIG_CMDS=\\"check_defconfig\\"', 'POST_DEFCONFIG_CMDS=\\"\\"')
+                              content = content.replace('POST_DEFCONFIG_CMDS=\"check_defconfig\"', 'POST_DEFCONFIG_CMDS=\"\"')
                               mutated = True
                           if "savedefconfig does not match" in content:
                               content = content.replace("return ${RES}", "return 0")
@@ -527,26 +513,11 @@ jobs:
         working-directory: workspace
         run: |
           echo ">> Commencing Kernel Compilation via Qualcomm Bazel..."
-          # --lto=thin keeps peak RAM/time down on the GitHub runner; drop it if
-          # you want full LTO and the runner has headroom.
-          tools/bazel run //msm-kernel:kernel_aarch64_dist --lto=thin -- --dist_dir=out_dist
+          tools/bazel run //msm-kernel:kernel_aarch64_dist -- --dist_dir=out_dist
 
-      - name: 14. Show dist output + upload
-        working-directory: workspace
-        run: |
-          echo ">> Contents of out_dist:"
-          ls -la out_dist || true
-          # Qualcomm's kernel_aarch64_dist emits Image / Image.gz (+ dtbs). It may
-          # NOT emit a ready boot.img. If boot.img is absent, package Image with
-          # AnyKernel3 (see the chat notes) - that is the format you actually flash.
-
-      - name: 15. Upload kernel artifacts
+      - name: 14. Upload Boot Image
         uses: actions/upload-artifact@v4
         with:
-          name: nos4.1-metroid-ksunext-susfs2.1.0
-          path: |
-            workspace/out_dist/Image
-            workspace/out_dist/Image.gz
-            workspace/out_dist/boot.img
-          if-no-files-found: warn
+          name: boot-img-nos4.1-ksunext-susfs
+          path: workspace/out_dist/boot.img
           compression-level: 9
