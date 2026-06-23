@@ -1,4 +1,4 @@
-name: Build Nothing OS 4.1 Kernel (KSU-Next + SUSFS)
+name: Build Nothing OS 4.1 Kernel (Wild KSU + SUSFS)
 
 on:
   push:
@@ -69,11 +69,16 @@ jobs:
           ref: sm8735/b/mr
           path: workspace/msm-kernel
 
-      - name: 5. Integrate KSU-Next (v2.0.0 line) + SUSFS kernel-VFS layer (coherent pair)
+      - name: 5. Integrate Wild KSU (wild-susfs branch) + matching SUSFS VFS layer
         working-directory: workspace/msm-kernel
         run: |
           set -e
 
+          # WildKernels publishes Wild KSU's `wild-susfs` branch and susfs4ksu
+          # commit 2df41de TOGETHER as SUSFS v2.0.0. The `wild-susfs` branch
+          # driver DEFINES the bridge symbols (susfs_is_current_ksu_domain etc.)
+          # that 2df41de's fs/susfs.c references — fixing the undefined-symbol
+          # link error that the KSU-Next v3.2.0 driver caused.
           SUSFS_PIN="2df41de789026a6422521606402576507c687435"
 
           fail_on_rej() {
@@ -89,16 +94,16 @@ jobs:
             fi
           }
 
-          echo ">> STAGE 1: Integrate KernelSU-Next (default 'next' branch)"
-          # Bare invocation: setup.sh's default branch IS 'next'. Passing 'next'
-          # as an arg fails (it expects a tag/commit) and silently falls back —
-          # so we omit the arg and let it check out its correct default.
-          curl -LSs "https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh" | bash
+          echo ">> STAGE 1: Integrate Wild KSU (wild-susfs branch)"
+          # `wild-susfs` is a REAL branch the setup script checks out (verified
+          # against the raw setup.sh). Unlike the bogus args tried before, this
+          # selects the susfs-integrated driver, not a silent fallback.
+          curl -LSs "https://raw.githubusercontent.com/WildKernels/Wild_KSU/wild/kernel/setup.sh" | bash -s wild-susfs
 
-          if [ ! -d drivers/kernelsu ] && [ ! -L drivers/kernelsu ] && [ ! -d KernelSU-Next ]; then
-            echo ">> [FATAL] KernelSU-Next setup did not install the driver." && exit 1
+          if [ ! -d drivers/kernelsu ] && [ ! -L drivers/kernelsu ] && [ ! -d KernelSU ] && [ ! -d Wild_KSU ]; then
+            echo ">> [FATAL] Wild KSU setup did not install the driver." && exit 1
           fi
-          echo ">> KSU-Next driver present."
+          echo ">> Wild KSU driver present."
 
           echo ">> STAGE 2: Supplying kernel-VFS layer from susfs4ksu @ $SUSFS_PIN"
           git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 /tmp/susfs4ksu
@@ -150,11 +155,13 @@ jobs:
           ksu_root = ""
           if os.path.islink("drivers/kernelsu"):
               ksu_root = os.path.dirname(os.path.realpath("drivers/kernelsu"))
-          elif os.path.isdir("KernelSU-Next"):
-              ksu_root = "KernelSU-Next"
+          elif os.path.isdir("KernelSU"):
+              ksu_root = "KernelSU"
+          elif os.path.isdir("Wild_KSU"):
+              ksu_root = "Wild_KSU"
           else:
               for item in os.listdir("."):
-                  if os.path.isdir(item) and item.lower().startswith("kernelsu"):
+                  if os.path.isdir(item) and item.lower().startswith(("kernelsu", "wild")):
                       ksu_root = item
                       break
 
@@ -162,9 +169,6 @@ jobs:
               print(">> KSU root not found; skipping reconciliation.")
               sys.exit(0)
 
-          # KSU-Next may name the hook file differently than classic KSU. Search
-          # for the try_umount definition across all driver .c files, not just
-          # core_hook.c, so the reconciler doesn't silently no-op.
           targets = []
           for root, dirs, files in os.walk(ksu_root):
               for fn in files:
@@ -277,15 +281,13 @@ jobs:
             rm -rf "$tmpd"
           fi
 
-      - name: 10. Inject KSU + SUSFS + KPM config flags (NP2-minimal, proven to link)
+      - name: 10. Inject KSU + SUSFS + KPM config flags (NP2-minimal)
         working-directory: workspace/msm-kernel
         run: |
-          # Mirror MiguVT/NP2_Kernel exactly: enable the SUSFS UMBRELLA only, plus
-          # KPM with its required deps. The fine-grained CONFIG_KSU_SUSFS_SUS_*/
-          # SPOOF/LOG/OPEN_REDIRECT sub-flags are intentionally OMITTED — one of
-          # them compiled the susfs_sdcard_monitor_fn path that referenced the
-          # undefined bridge symbol susfs_is_current_ksu_domain. NP2 ships this
-          # minimal set and links cleanly on a Nothing device.
+          # Minimal NP2-proven set: SUSFS umbrella + KPM with its deps. The
+          # undefined-symbol issue was a manager-version mismatch, not a config
+          # problem, so we keep the minimal baseline and let the wild-susfs
+          # driver supply the bridge symbols.
           find arch/arm64/configs/ -type f \( -name "*_defconfig" -o -name "*.config" -o -name "*.fragment" \) \
             -exec sh -c '
               echo "CONFIG_KSU=y" >> "$1"
@@ -427,6 +429,6 @@ jobs:
       - name: 14. Upload Boot Image
         uses: actions/upload-artifact@v4
         with:
-          name: boot-img-nos4.1-ksunext-susfs
+          name: boot-img-nos4.1-wildksu-susfs
           path: workspace/out_dist/boot.img
           compression-level: 9
