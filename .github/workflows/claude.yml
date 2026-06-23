@@ -1,4 +1,4 @@
-name: Build Nothing OS 4.1 Kernel (Wild KSU + SUSFS)
+name: Build Nothing OS 4.1 Kernel (KSU-Next next-susfs + SUSFS v2)
 
 on:
   push:
@@ -69,16 +69,20 @@ jobs:
           ref: sm8735/b/mr
           path: workspace/msm-kernel
 
-      - name: 5. Integrate Wild KSU (wild-susfs branch) + matching SUSFS VFS layer
+      - name: 5. Integrate KSU-Next (pershoot next-susfs) + SUSFS VFS @ 2df41de
         working-directory: workspace/msm-kernel
         run: |
           set -e
 
-          # WildKernels publishes Wild KSU's `wild-susfs` branch and susfs4ksu
-          # commit 2df41de TOGETHER as SUSFS v2.0.0. The `wild-susfs` branch
-          # driver DEFINES the bridge symbols (susfs_is_current_ksu_domain etc.)
-          # that 2df41de's fs/susfs.c references — fixing the undefined-symbol
-          # link error that the KSU-Next v3.2.0 driver caused.
+          # VERIFIED PAIRING (WildKernels android15-6.6 release):
+          #   Driver: pershoot/KernelSU-Next `next-susfs` branch. Its setup.sh
+          #           HARDCODES BRANCH="next-susfs" and defaults to MANUAL HOOKS.
+          #           Bare invocation checks out the latest next-susfs TAG.
+          #           This driver DEFINES the bridge symbols (susfs_is_current_ksu_domain
+          #           etc.) that earlier rifsxd-`next`/Wild-KSU drivers did NOT.
+          #   SUSFS:  susfs4ksu gki-android15-6.6 @ 2df41de (the commit WildKernels
+          #           pairs with this driver) — SUSFS v2.x.
+          #   Manual hooks => MUST also apply 60_scope-minimized_manual_hooks.patch.
           SUSFS_PIN="2df41de789026a6422521606402576507c687435"
 
           fail_on_rej() {
@@ -94,22 +98,12 @@ jobs:
             fi
           }
 
-          echo ">> STAGE 1: Integrate Wild KSU (wild-susfs branch)"
-          # `wild-susfs` is a REAL branch the setup script checks out (verified
-          # against the raw setup.sh). Unlike the bogus args tried before, this
-          # selects the susfs-integrated driver, not a silent fallback.
-          curl -LSs "https://raw.githubusercontent.com/WildKernels/Wild_KSU/wild/kernel/setup.sh" | bash -s wild-susfs
-
-          if [ ! -d drivers/kernelsu ] && [ ! -L drivers/kernelsu ] && [ ! -d KernelSU ] && [ ! -d Wild_KSU ]; then
-            echo ">> [FATAL] Wild KSU setup did not install the driver." && exit 1
-          fi
-          echo ">> Wild KSU driver present."
-
-          echo ">> STAGE 2: Supplying kernel-VFS layer from susfs4ksu @ $SUSFS_PIN"
+          echo ">> STAGE 1: Clone susfs4ksu @ $SUSFS_PIN (VFS layer source)"
           git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 /tmp/susfs4ksu
           ( cd /tmp/susfs4ksu && git checkout "$SUSFS_PIN" )
           echo ">> susfs4ksu pinned to $(cd /tmp/susfs4ksu && git rev-parse --short HEAD)"
 
+          echo ">> STAGE 2: Copy SUSFS VFS sources + headers into tree"
           cp -v /tmp/susfs4ksu/kernel_patches/fs/* fs/
           cp -v /tmp/susfs4ksu/kernel_patches/include/linux/* include/linux/
 
@@ -118,23 +112,39 @@ jobs:
             echo "CFLAGS_susfs.o += -Wno-unused-variable -Wno-unused-function -Wno-error" >> fs/Makefile
           fi
 
+          echo ">> STAGE 3: Apply SUSFS VFS patch (50_add_susfs)"
           GKI_PATCH=$(find /tmp/susfs4ksu -type f -name "50_add_susfs_in_gki-android15-6.6.patch" | head -n 1)
           [ -z "$GKI_PATCH" ] && GKI_PATCH=$(find /tmp/susfs4ksu -type f -name "*.patch" | grep -iE "gki.*6\.6" | head -n 1)
           if [ -z "$GKI_PATCH" ]; then
             echo ">> [FATAL] No GKI android15-6.6 SUSFS VFS patch found." && exit 1
           fi
-          echo ">> Applying kernel-VFS patch: $GKI_PATCH"
+          echo ">> Applying VFS patch: $GKI_PATCH"
           patch -p1 --fuzz=3 < "$GKI_PATCH" || true
           fail_on_rej
 
+          echo ">> STAGE 4: Apply manual-hooks patch (driver defaults to manual hooks)"
           HOOK_PATCH=$(find /tmp/susfs4ksu -type f -name "*scope-minimized_manual_hooks*.patch" | head -n 1)
           if [ -n "$HOOK_PATCH" ]; then
-            echo ">> Applying KSU manual-hook patch: $HOOK_PATCH"
+            echo ">> Applying manual-hook patch: $HOOK_PATCH"
             patch -p1 --fuzz=3 < "$HOOK_PATCH" || true
             fail_on_rej
+          else
+            echo ">> [WARN] No scope-minimized_manual_hooks patch found in susfs4ksu."
+            echo ">> The next-susfs driver defaults to manual hooks; without this patch"
+            echo ">> the kernel-side hook points may be absent. Continuing, but watch the build."
           fi
 
-          echo ">> STAGE 3: Wire Kconfig + neutralize fingerprint modpost stub"
+          echo ">> STAGE 5: Integrate pershoot KernelSU-Next (next-susfs, manual hooks)"
+          # Bare invocation: setup.sh hardcodes BRANCH=next-susfs and checks out the
+          # latest tag; NO second arg => manual hooks (matches the patch above).
+          curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/refs/heads/next-susfs/kernel/setup.sh" | bash
+
+          if [ ! -d drivers/kernelsu ] && [ ! -L drivers/kernelsu ] && [ ! -d KernelSU-Next ]; then
+            echo ">> [FATAL] KernelSU-Next (next-susfs) setup did not install the driver." && exit 1
+          fi
+          echo ">> next-susfs driver present."
+
+          echo ">> STAGE 6: Wire Kconfig + neutralize fingerprint modpost stub"
           if [ -d drivers/kernelsu ] && ! grep -q "kernelsu" drivers/Kconfig; then
             sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
           fi
@@ -155,13 +165,11 @@ jobs:
           ksu_root = ""
           if os.path.islink("drivers/kernelsu"):
               ksu_root = os.path.dirname(os.path.realpath("drivers/kernelsu"))
-          elif os.path.isdir("KernelSU"):
-              ksu_root = "KernelSU"
-          elif os.path.isdir("Wild_KSU"):
-              ksu_root = "Wild_KSU"
+          elif os.path.isdir("KernelSU-Next"):
+              ksu_root = "KernelSU-Next"
           else:
               for item in os.listdir("."):
-                  if os.path.isdir(item) and item.lower().startswith(("kernelsu", "wild")):
+                  if os.path.isdir(item) and item.lower().startswith("kernelsu"):
                       ksu_root = item
                       break
 
@@ -284,10 +292,6 @@ jobs:
       - name: 10. Inject KSU + SUSFS + KPM config flags (NP2-minimal)
         working-directory: workspace/msm-kernel
         run: |
-          # Minimal NP2-proven set: SUSFS umbrella + KPM with its deps. The
-          # undefined-symbol issue was a manager-version mismatch, not a config
-          # problem, so we keep the minimal baseline and let the wild-susfs
-          # driver supply the bridge symbols.
           find arch/arm64/configs/ -type f \( -name "*_defconfig" -o -name "*.config" -o -name "*.fragment" \) \
             -exec sh -c '
               echo "CONFIG_KSU=y" >> "$1"
@@ -429,6 +433,6 @@ jobs:
       - name: 14. Upload Boot Image
         uses: actions/upload-artifact@v4
         with:
-          name: boot-img-nos4.1-wildksu-susfs
+          name: boot-img-nos4.1-ksunext-susfs-v2
           path: workspace/out_dist/boot.img
           compression-level: 9
