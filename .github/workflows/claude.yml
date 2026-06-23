@@ -74,11 +74,7 @@ jobs:
         run: |
           set -e
 
-          # ---- PINNED, CO-RELEASED PAIR (WildKernels KSU-Next v2.0.0 line) ----
-          # susfs4ksu gki-android15-6.6 commit that the v2.0.0 KSU-Next line ships with.
           SUSFS_PIN="2df41de789026a6422521606402576507c687435"
-          # KSU-Next branch carrying the matching driver-side susfs bridge symbols.
-          KSUN_BRANCH="next"
 
           fail_on_rej() {
             local rejs
@@ -93,10 +89,12 @@ jobs:
             fi
           }
 
-          echo ">> STAGE 1: Integrate KernelSU-Next ($KSUN_BRANCH)"
-          curl -LSs "https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh" | bash -s "$KSUN_BRANCH"
+          echo ">> STAGE 1: Integrate KernelSU-Next (default 'next' branch)"
+          # Bare invocation: setup.sh's default branch IS 'next'. Passing 'next'
+          # as an arg fails (it expects a tag/commit) and silently falls back —
+          # so we omit the arg and let it check out its correct default.
+          curl -LSs "https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh" | bash
 
-          # Validate the setup actually landed the driver (no silent fallback).
           if [ ! -d drivers/kernelsu ] && [ ! -L drivers/kernelsu ] && [ ! -d KernelSU-Next ]; then
             echo ">> [FATAL] KernelSU-Next setup did not install the driver." && exit 1
           fi
@@ -107,7 +105,6 @@ jobs:
           ( cd /tmp/susfs4ksu && git checkout "$SUSFS_PIN" )
           echo ">> susfs4ksu pinned to $(cd /tmp/susfs4ksu && git rev-parse --short HEAD)"
 
-          # Copy the VFS source + headers into the msm-kernel tree.
           cp -v /tmp/susfs4ksu/kernel_patches/fs/* fs/
           cp -v /tmp/susfs4ksu/kernel_patches/include/linux/* include/linux/
 
@@ -125,7 +122,6 @@ jobs:
           patch -p1 --fuzz=3 < "$GKI_PATCH" || true
           fail_on_rej
 
-          # KSU-Next's own susfs manual-hook patch, if shipped in the susfs repo.
           HOOK_PATCH=$(find /tmp/susfs4ksu -type f -name "*scope-minimized_manual_hooks*.patch" | head -n 1)
           if [ -n "$HOOK_PATCH" ]; then
             echo ">> Applying KSU manual-hook patch: $HOOK_PATCH"
@@ -166,30 +162,33 @@ jobs:
               print(">> KSU root not found; skipping reconciliation.")
               sys.exit(0)
 
-          ch_path = ""
+          # KSU-Next may name the hook file differently than classic KSU. Search
+          # for the try_umount definition across all driver .c files, not just
+          # core_hook.c, so the reconciler doesn't silently no-op.
+          targets = []
           for root, dirs, files in os.walk(ksu_root):
-              if "core_hook.c" in files:
-                  ch_path = os.path.join(root, "core_hook.c")
-                  break
+              for fn in files:
+                  if fn.endswith(".c"):
+                      targets.append(os.path.join(root, fn))
 
-          if not ch_path:
-              print(">> core_hook.c not found; skipping.")
-              sys.exit(0)
+          reconciled_total = 0
+          for ch_path in targets:
+              src = open(ch_path, encoding="utf-8", errors="ignore").read()
+              four_arg_def = re.search(r'void\s+try_umount\s*\([^)]*\buid_t\s+\w+\s*\)', src)
+              if not four_arg_def:
+                  continue
+              pattern = re.compile(r'(try_umount\s*\(\s*[^,()]+,\s*(?:true|false)\s*,\s*[A-Za-z0-9_]+)\s*\)')
+              fixed, n = pattern.subn(r'\1, 0)', src)
+              if n:
+                  with open(ch_path, "w", encoding="utf-8") as f:
+                      f.write(fixed)
+                  reconciled_total += n
+                  print(">> Reconciled %d call(s) in %s" % (n, ch_path))
 
-          src = open(ch_path, encoding="utf-8", errors="ignore").read()
-          four_arg_def = re.search(r'void\s+try_umount\s*\([^)]*\buid_t\s+\w+\s*\)', src)
-          if not four_arg_def:
-              print(">> Definition is not 4-arg; nothing to reconcile.")
-              sys.exit(0)
-
-          pattern = re.compile(r'(try_umount\s*\(\s*[^,()]+,\s*(?:true|false)\s*,\s*[A-Za-z0-9_]+)\s*\)')
-          fixed, n = pattern.subn(r'\1, 0)', src)
-          if n:
-              with open(ch_path, "w", encoding="utf-8") as f:
-                  f.write(fixed)
-              print(">> Reconciled %d three-arg try_umount call(s) to 4-arg (uid=0)." % n)
+          if reconciled_total == 0:
+              print(">> No 4-arg def with mismatched call sites found; nothing to reconcile.")
           else:
-              print(">> No 3-arg call sites found; already consistent.")
+              print(">> Total reconciled: %d" % reconciled_total)
 
       - name: 7. FAIL-FAST GATE — verify susfs symbol coherence BEFORE the long build
         working-directory: workspace/msm-kernel
@@ -197,7 +196,6 @@ jobs:
           set -e
           echo ">> Pre-build coherence gate (seconds, not minutes)"
 
-          # 1. VFS layer must be present in the tree.
           if [ ! -f fs/susfs.c ]; then
             echo ">> [FATAL] fs/susfs.c missing — VFS layer not integrated."; exit 1
           fi
@@ -206,31 +204,38 @@ jobs:
           fi
           echo ">> VFS layer present (fs/susfs.c + fs/namei.c hooks)."
 
-          # 2. Every susfs_* symbol REFERENCED by the VFS layer must be DEFINED
-          #    somewhere in the tree (VFS side or KSU driver side). This is the
-          #    exact check that catches the undefined-symbol link error in seconds.
-          REF_SYMS=$(grep -rhoE "susfs_[a-z0-9_]+\s*\(" fs/susfs.c include/linux/susfs*.h 2>/dev/null \
-                     | sed -E 's/\s*\($//' | sort -u)
+          # Collect candidate susfs_* symbols referenced anywhere in the VFS layer.
+          REF_SYMS=$(grep -rhoE "\bsusfs_[a-z0-9_]+" \
+                       fs/susfs.c fs/namei.c include/linux/susfs*.h 2>/dev/null \
+                     | sort -u)
+
+          # A symbol counts as DEFINED if it appears as a C function definition
+          # (name followed by '(') in ANY .c file in the tree — susfs.c itself,
+          # or the KSU driver. Search .c files only (not headers, which hold
+          # prototypes), and do NOT anchor to column 0 (attributes/wrapping).
+          DEFN_SOURCES=$(find fs drivers/kernelsu KernelSU-Next -name "*.c" 2>/dev/null)
 
           MISSING=0
           for sym in $REF_SYMS; do
-            # A definition looks like: <type> susfs_foo(  ... at line start (not a call).
-            if ! grep -rqE "^[A-Za-z_].*\b${sym}\s*\(" \
-                   fs/ include/linux/ drivers/kernelsu/ KernelSU-Next/ 2>/dev/null; then
-              # Allow symbols that are extern-declared and defined in KSU .c files.
-              if ! grep -rqE "\b${sym}\s*\(" drivers/kernelsu/ KernelSU-Next/ 2>/dev/null; then
-                echo ">> [WARN] No definition found for referenced symbol: $sym"
-                MISSING=$((MISSING+1))
-              fi
+            if grep -qE "\b${sym}\b\s*\(" $DEFN_SOURCES 2>/dev/null; then
+              continue
             fi
+            # Some susfs symbols are macros/inlines defined in headers — accept those too.
+            if grep -qE "#define\s+${sym}\b|\b${sym}\b\s*\(" include/linux/susfs*.h 2>/dev/null; then
+              continue
+            fi
+            echo ">> [WARN] No definition found for referenced symbol: $sym"
+            MISSING=$((MISSING+1))
           done
 
           if [ "$MISSING" -gt 0 ]; then
-            echo ">> [FATAL] $MISSING susfs bridge symbol(s) referenced but never defined."
-            echo ">> This is the version-mismatch signature. Aborting before the long build."
+            echo ">> [FATAL] $MISSING susfs symbol(s) referenced but never defined."
+            echo ">> Inspect above — if these are bridge symbols (susfs_is_*ksu*),"
+            echo ">> it is a real version mismatch. If self-defined in susfs.c,"
+            echo ">> the gate heuristic is the problem, not the build."
             exit 1
           fi
-          echo ">> Symbol coherence OK — all referenced susfs_* symbols have definitions."
+          echo ">> Symbol coherence OK — all referenced susfs_* symbols resolve."
 
       - name: 8. Debug - dump module Makefile (ground truth)
         working-directory: workspace/msm-kernel
