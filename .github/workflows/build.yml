@@ -86,7 +86,6 @@ jobs:
           
           if ! grep -q "susfs.o" fs/Makefile; then
             echo "obj-y += susfs.o" >> fs/Makefile
-            # Fixes compilation breaks by dropping strict unused parameter flags explicitly for susfs components
             echo "CFLAGS_susfs.o += -Wno-unused-variable -Wno-error" >> fs/Makefile
           fi
 
@@ -109,17 +108,28 @@ jobs:
             cd ..
           fi
 
-          echo ">> Force-registering Kconfig architectural symbol rules..."
-          if ! grep -q "config SUSFS" fs/Kconfig; then
-            printf "\nconfig SUSFS\n\tbool \"SU Secondary Filesystem Support\"\n\tdefault y\n\thelp\n\t  Enable support for SUSFS masking hooks natively within GKI VFS layers.\n" >> fs/Kconfig
-          fi
-
           if [ -d drivers/kernelsu ] && ! grep -q "kernelsu" drivers/Kconfig; then
             sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
           fi
 
+          echo ">> Neutralizing problematic fingerprint module that triggers modpost errors..."
+          if [ -d drivers/input/fingerprint ]; then
+            echo "obj-y =" > drivers/input/fingerprint/Makefile
+          fi
+
           echo ">> Forcing Config Flags into all target build defconfigs..."
-          find arch/arm64/configs/ -type f \( -name "*_defconfig" -o -name "*.config" -o -name "*.fragment" \) -exec sh -c 'echo "\nCONFIG_KSU=y\nCONFIG_SUSFS=y" >> "$1"' _ {} \;
+          find arch/arm64/configs/ -type f \( -name "*_defconfig" -o -name "*.config" -o -name "*.fragment" \) -exec sh -c '
+            echo "CONFIG_KSU=y" >> "$1"
+            echo "CONFIG_SUSFS=y" >> "$1"
+            echo "CONFIG_KSU_SUSFS=y" >> "$1"
+            echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> "$1"
+            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> "$1"
+            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> "$1"
+            echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> "$1"
+            echo "CONFIG_KSU_SUSFS_SPOOFER=y" >> "$1"
+            echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> "$1"
+            echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> "$1"
+          ' _ {} \;
 
       - name: 5.5 Prepare Qualcomm Build Package Extensions
         working-directory: workspace
