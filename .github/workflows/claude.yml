@@ -1,4 +1,4 @@
-name: Build Nothing OS 4.1 Kernel (SUSFS)
+name: CLAUDE - Build Nothing OS 4.1 Kernel (SUSFS) 
 
 on:
   workflow_dispatch:
