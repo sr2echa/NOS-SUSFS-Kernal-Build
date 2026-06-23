@@ -277,21 +277,23 @@ jobs:
             rm -rf "$tmpd"
           fi
 
-      - name: 10. Inject KSU + SUSFS + KPM config flags
+      - name: 10. Inject KSU + SUSFS + KPM config flags (NP2-minimal, proven to link)
         working-directory: workspace/msm-kernel
         run: |
+          # Mirror MiguVT/NP2_Kernel exactly: enable the SUSFS UMBRELLA only, plus
+          # KPM with its required deps. The fine-grained CONFIG_KSU_SUSFS_SUS_*/
+          # SPOOF/LOG/OPEN_REDIRECT sub-flags are intentionally OMITTED — one of
+          # them compiled the susfs_sdcard_monitor_fn path that referenced the
+          # undefined bridge symbol susfs_is_current_ksu_domain. NP2 ships this
+          # minimal set and links cleanly on a Nothing device.
           find arch/arm64/configs/ -type f \( -name "*_defconfig" -o -name "*.config" -o -name "*.fragment" \) \
             -exec sh -c '
               echo "CONFIG_KSU=y" >> "$1"
-              echo "CONFIG_KPM=y" >> "$1"
               echo "CONFIG_KSU_SUSFS=y" >> "$1"
-              echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> "$1"
-              echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> "$1"
-              echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> "$1"
-              echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> "$1"
-              echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> "$1"
-              echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> "$1"
-              echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> "$1"
+              echo "CONFIG_KPM=y" >> "$1"
+              echo "CONFIG_KALLSYMS=y" >> "$1"
+              echo "CONFIG_KALLSYMS_ALL=y" >> "$1"
+              echo "CONFIG_KPROBES=y" >> "$1"
             ' _ {} \;
 
       - name: 11. Prepare Qualcomm Build Package Extensions
