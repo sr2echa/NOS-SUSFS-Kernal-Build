@@ -200,7 +200,16 @@ jobs:
         run: |
           set -e
           echo ">> Verifying driver + susfs are wired in"
-          [ -e drivers/kernelsu/core_hook.c ] || { echo ">> [FATAL] core_hook.c missing"; exit 1; }
+          # KernelSU-Next 'dev' refactored core_hook.c into multiple files
+          # (sucompat.c, supercall.c, setuid_hook.c, ...). Check for the driver
+          # dir + any .c source, not a specific (version-dependent) filename.
+          if ! ls drivers/kernelsu/*.c >/dev/null 2>&1; then
+            echo ">> [FATAL] no .c sources under drivers/kernelsu (symlink broken or empty)"
+            ls -la drivers/kernelsu || true
+            exit 1
+          fi
+          echo ">> Driver sources present:"
+          ls drivers/kernelsu/*.c | sed 's#^#   #'
           [ -e fs/susfs.c ]                  || { echo ">> [FATAL] fs/susfs.c missing"; exit 1; }
           [ -e include/linux/susfs.h ]       || { echo ">> [FATAL] include/linux/susfs.h missing"; exit 1; }
           grep -q "susfs.o" fs/Makefile      || { echo ">> [FATAL] susfs.o not in fs/Makefile"; exit 1; }
@@ -208,7 +217,7 @@ jobs:
           echo ">> Fingerprint driver preserved:"
           [ -e drivers/input/fingerprint/Makefile ] && head -n 3 drivers/input/fingerprint/Makefile || echo "   (no fingerprint dir in this tree)"
           echo ">> OK: driver + SUSFS VFS present and wired; fingerprint intact."
-
+          
       - name: 7. Debug - dump module Makefile (ground truth)
         working-directory: workspace/msm-kernel
         run: |
