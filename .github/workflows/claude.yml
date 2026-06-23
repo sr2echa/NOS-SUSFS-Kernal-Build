@@ -1,10 +1,7 @@
-name: CLAUDE - Build Nothing OS 4.1 Kernel (SUSFS) 
+name: CLAUDE - Build Nothing OS 4.1 Kernel (SUSFS)
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
 
 permissions:
   contents: read
@@ -73,82 +70,133 @@ jobs:
           ref: sm8735/b/mr
           path: workspace/msm-kernel
 
-      - name: 5. Inject KernelSU-Next & SUSFS
+      - name: 5. Inject KernelSU-Next (next-susfs) & SUSFS
         working-directory: workspace/msm-kernel
         run: |
-          echo ">> Downloading KernelSU-Next..."
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
+          set -e
 
-          echo ">> Downloading SUSFS patches..."
-          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 /tmp/susfs4ksu
+          echo "=================================================="
+          echo ">> STAGE 1: Install KernelSU-Next (next-susfs branch)"
+          echo ">> This branch defines susfs_is_current_ksu_domain on"
+          echo ">> the KSU side, so no separate KSU patch is needed."
+          echo "=================================================="
+          curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/refs/heads/next-susfs/kernel/setup.sh" | bash -s next-susfs
 
-          echo ">> Dumping susfs4ksu repo structure for diagnostics..."
-          find /tmp/susfs4ksu -type f | sort
+          echo "=================================================="
+          echo ">> STAGE 2: Discover the matching susfs4ksu branch"
+          echo "=================================================="
+          echo ">> Available pershoot/susfs4ksu branches:"
+          git ls-remote --heads https://gitlab.com/pershoot/susfs4ksu.git | awk '{print $2}' | sed 's#refs/heads/##'
 
-          echo ">> Applying SUSFS core source files to kernel..."
-          cp -r /tmp/susfs4ksu/kernel_patches/fs/* fs/
-          cp -r /tmp/susfs4ksu/kernel_patches/include/linux/* include/linux/
+          # Prefer an android15-6.6 branch; fall back to any 6.6 branch.
+          SUSFS_BRANCH=$(git ls-remote --heads https://gitlab.com/pershoot/susfs4ksu.git \
+            | awk '{print $2}' | sed 's#refs/heads/##' \
+            | grep -iE "android15-6\.6" | head -n 1)
+
+          if [ -z "$SUSFS_BRANCH" ]; then
+            SUSFS_BRANCH=$(git ls-remote --heads https://gitlab.com/pershoot/susfs4ksu.git \
+              | awk '{print $2}' | sed 's#refs/heads/##' \
+              | grep -iE "6\.6" | head -n 1)
+          fi
+
+          if [ -z "$SUSFS_BRANCH" ]; then
+            echo ">> [WARN] No 6.6 branch on pershoot fork; falling back to simonpunk."
+            SUSFS_REPO="https://gitlab.com/simonpunk/susfs4ksu.git"
+            SUSFS_BRANCH="gki-android15-6.6"
+          else
+            SUSFS_REPO="https://gitlab.com/pershoot/susfs4ksu.git"
+          fi
+
+          echo ">> Selected SUSFS repo:   $SUSFS_REPO"
+          echo ">> Selected SUSFS branch: $SUSFS_BRANCH"
+          git clone --depth 1 "$SUSFS_REPO" -b "$SUSFS_BRANCH" /tmp/susfs4ksu
+
+          echo "=================================================="
+          echo ">> STAGE 3: Dump susfs4ksu layout for diagnostics"
+          echo "=================================================="
+          find /tmp/susfs4ksu -type f -not -path "*/.git/*" | sort
+
+          echo "=================================================="
+          echo ">> STAGE 4: Copy SUSFS sources into msm-kernel tree"
+          echo "=================================================="
+          cp -v /tmp/susfs4ksu/kernel_patches/fs/* fs/
+          cp -v /tmp/susfs4ksu/kernel_patches/include/linux/* include/linux/
 
           if ! grep -q "susfs.o" fs/Makefile; then
             echo "obj-y += susfs.o" >> fs/Makefile
             echo "CFLAGS_susfs.o += -Wno-unused-variable -Wno-unused-function -Wno-error" >> fs/Makefile
           fi
 
-          echo ">> Applying SUSFS GKI VFS patch..."
-          SUSFS_KERNEL_PATCH=$(find /tmp/susfs4ksu -type f -name "*.patch" | grep -i "gki" | head -n 1)
-          if [ -n "$SUSFS_KERNEL_PATCH" ]; then
-            echo ">> Applying GKI patch: $SUSFS_KERNEL_PATCH"
-            patch -p1 --fuzz=3 < "$SUSFS_KERNEL_PATCH" || true
-          else
-            echo ">> [WARN] No GKI patch found, skipping."
-          fi
+          echo "=================================================="
+          echo ">> STAGE 5: Apply the SUSFS GKI VFS patch to msm-kernel"
+          echo "=================================================="
+          GKI_PATCH=$(find /tmp/susfs4ksu -type f -name "*.patch" | grep -iE "gki.*6\.6" | head -n 1)
+          [ -z "$GKI_PATCH" ] && GKI_PATCH=$(find /tmp/susfs4ksu -type f -name "*.patch" | grep -i "gki" | head -n 1)
 
-          echo ">> Locating KernelSU-Next root directory..."
-          KSU_ROOT=$(find . -maxdepth 1 -type d -name "KernelSU*" | head -n 1)
-
-          if [ -z "$KSU_ROOT" ] && [ -L drivers/kernelsu ]; then
-            KSU_ROOT=$(dirname "$(readlink -f drivers/kernelsu)")
-          fi
-
-          if [ -z "$KSU_ROOT" ]; then
-            echo "[FATAL] Could not locate KernelSU-Next root directory!" && exit 1
-          fi
-
-          echo ">> KernelSU-Next root resolved to: $KSU_ROOT"
-
-          echo ">> Searching for KSU SUSFS patch..."
-          PATCH_FILE=$(find /tmp/susfs4ksu -type f -name "*.patch" | grep -i "ksunext" | head -n 1)
-
-          if [ -z "$PATCH_FILE" ]; then
-            PATCH_FILE=$(find /tmp/susfs4ksu -type f -name "*.patch" | grep -v "gki" | head -n 1)
-          fi
-
-          if [ -z "$PATCH_FILE" ]; then
-            echo "[FATAL] Could not find any KSU SUSFS patch in susfs4ksu repo!"
-            echo "Available patches:"
+          if [ -z "$GKI_PATCH" ]; then
+            echo "[FATAL] No GKI SUSFS patch found in susfs4ksu repo!"
             find /tmp/susfs4ksu -type f -name "*.patch"
             exit 1
           fi
 
-          echo ">> Applying KSU patch from $KSU_ROOT: $PATCH_FILE"
-          (cd "$KSU_ROOT" && patch -p1 --fuzz=3 < "$PATCH_FILE")
+          echo ">> Applying GKI patch: $GKI_PATCH"
+          patch -p1 --fuzz=3 < "$GKI_PATCH" || true
 
-          if ! grep -rq "susfs_is_current_ksu_domain" "$KSU_ROOT"; then
-            echo "[FATAL] Patch did not introduce susfs_is_current_ksu_domain — patch likely failed."
+          # Optional manual-hooks patch (present in pershoot/next-susfs flows).
+          # Needed when kprobe hooks are not used. Applied tolerantly.
+          MANUAL_HOOKS=$(find /tmp/susfs4ksu -type f -name "*scope*manual*hooks*.patch" | head -n 1)
+          if [ -n "$MANUAL_HOOKS" ]; then
+            echo ">> Applying manual hooks patch: $MANUAL_HOOKS"
+            patch -p1 --fuzz=3 < "$MANUAL_HOOKS" || echo ">> [WARN] manual hooks patch had rejects; continuing."
+          fi
+
+          echo "=================================================="
+          echo ">> STAGE 6: Verify the KSU side DEFINES the symbol"
+          echo ">> that previously failed to link."
+          echo "=================================================="
+          KSU_ROOT=$(find . -maxdepth 1 -type d -name "KernelSU*" | head -n 1)
+          if [ -z "$KSU_ROOT" ] && [ -L drivers/kernelsu ]; then
+            KSU_ROOT=$(dirname "$(readlink -f drivers/kernelsu)")
+          fi
+          echo ">> KSU root: $KSU_ROOT"
+
+          # The symbol must be DEFINED (not just declared) somewhere in the KSU tree.
+          if ! grep -rIl "susfs_is_current_ksu_domain" "$KSU_ROOT" >/dev/null 2>&1; then
+            echo "[FATAL] susfs_is_current_ksu_domain is NOT present in the KSU tree."
+            echo "        The next-susfs branch did not provide it. This is the"
+            echo "        same class of link failure as before; the KSU/SUSFS"
+            echo "        versions are not aligned for 6.6 yet."
             exit 1
           fi
-          echo ">> KSU SUSFS patch verified OK."
+          echo ">> Symbol present in KSU tree — link should now succeed."
 
+          echo "=================================================="
+          echo ">> STAGE 7: Remove protected-export enforcement"
+          echo ">> (otherwise SUSFS symbol changes break Wi-Fi/BT)"
+          echo "=================================================="
+          # Strip the protected_exports lists from BUILD.bazel wherever they appear,
+          # and delete the protected-export ABI files. Handles both msm-kernel and
+          # any common/ tree without failing if a path is absent.
+          for BZL in $(grep -rIl "abi_gki_protected_exports" . 2>/dev/null || true); do
+            echo ">> Cleaning protected_exports refs in: $BZL"
+            sed -i '/abi_gki_protected_exports/d' "$BZL" || true
+          done
+          find . -type f -name "abi_gki_protected_exports_*" -print -delete 2>/dev/null || true
+
+          echo "=================================================="
+          echo ">> STAGE 8: Wire up KSU Kconfig + neutralize fingerprint"
+          echo "=================================================="
           if [ -d drivers/kernelsu ] && ! grep -q "kernelsu" drivers/Kconfig; then
             sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
           fi
 
-          echo ">> Neutralizing fingerprint module..."
           if [ -d drivers/input/fingerprint ]; then
             echo "obj-y =" > drivers/input/fingerprint/Makefile
           fi
 
-          echo ">> Injecting KSU and SUSFS config flags into defconfigs..."
+          echo "=================================================="
+          echo ">> STAGE 9: Inject KSU + SUSFS config flags"
+          echo "=================================================="
           find arch/arm64/configs/ -type f \( -name "*_defconfig" -o -name "*.config" -o -name "*.fragment" \) \
             -exec sh -c '
               echo "CONFIG_KSU=y" >> "$1"
