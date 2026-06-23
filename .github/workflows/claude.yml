@@ -74,11 +74,10 @@ jobs:
         run: |
           set -e
 
-          # SukiSU's driver carries the KSU-side susfs glue (the part that used to
-          # break via 10_enable_susfs_for_ksu.patch). The kernel-VFS layer
-          # (fs/susfs.c + hooks in fs/namei.c etc.) lives in the host tree and
-          # cannot ship inside the SukiSU driver, so it comes from susfs4ksu.
-          # This pin is the exact commit the proven SukiSU + SUSFS v2.1.0 build uses.
+          # SukiSU's driver carries the KSU-side susfs glue. The kernel-VFS layer
+          # (fs/susfs.c + hooks in fs/namei.c etc.) lives in the host tree and is
+          # supplied from susfs4ksu. This pin is the exact commit the proven
+          # SukiSU + SUSFS v2.1.0 build uses.
           SUSFS_PIN="709129bc30aadb6a2a16b813cd49f675c30127dd"
 
           fail_on_rej() {
@@ -94,7 +93,7 @@ jobs:
             fi
           }
 
-          echo ">> STAGE 1: Integrate SukiSU (susfs-main = built-in KSU-side susfs)"
+          echo ">> STAGE 1: Integrate SukiSU"
           curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s susfs-main
 
           KSU_ROOT=""
@@ -104,7 +103,7 @@ jobs:
           [ -z "$KSU_ROOT" ] && KSU_ROOT=$(find . -maxdepth 1 -type d -name "KernelSU*" | head -n 1)
           echo ">> SukiSU root: ${KSU_ROOT:-<not found>}"
 
-          echo ">> STAGE 2: Diagnostic — what did SukiSU's setup actually install?"
+          echo ">> STAGE 2: Diagnostic — what did SukiSU's setup install?"
           find . -path ./.git -prune -o -type f \( -name "susfs*.c" -o -name "susfs*.h" \) -print | sort || true
           if grep -q "susfs" fs/namei.c 2>/dev/null; then
             echo "   -- host fs/namei.c already references susfs: YES"
@@ -118,8 +117,7 @@ jobs:
           fi
 
           if [ "$HOST_VFS_PRESENT" -eq 1 ]; then
-            echo ">> Kernel-VFS layer already present; SukiSU's setup covered it."
-            echo ">> Skipping susfs4ksu (avoids duplicate susfs.c / double-patch)."
+            echo ">> Kernel-VFS layer already present; SukiSU covered it. Skipping susfs4ksu."
           else
             echo ">> STAGE 3: Supplying kernel-VFS layer from susfs4ksu @ $SUSFS_PIN"
             git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 /tmp/susfs4ksu
@@ -204,7 +202,7 @@ jobs:
           else:
               print(">> No 3-arg call sites found; already consistent.")
 
-      - name: 7. Debug - dump module Makefile (ground truth for Stage 6)
+      - name: 7. Debug - dump module Makefile (ground truth)
         working-directory: workspace/msm-kernel
         run: |
           echo "===== kernel/module/Makefile (numbered) ====="
@@ -212,13 +210,13 @@ jobs:
           echo "===== grep gki_module ====="
           grep -n "gki_module" kernel/module/Makefile || true
 
-      - name: 8. Protected-Exports Neutralization (surgical, single-line only)
+      - name: 8. Protected-Exports Neutralization (script-only, Makefile untouched)
         working-directory: workspace/msm-kernel
         shell: python
         run: |
           import os
 
-          print(">> STAGE 6: Neutralize protected-export ENFORCEMENT (single-line only)")
+          print(">> STAGE 6: Neutralize protected-export ENFORCEMENT (script-only)")
 
           # 1. Ensure the protected-exports source list exists (empty is valid).
           pe_file = "android/abi_gki_protected_exports_aarch64"
@@ -226,20 +224,23 @@ jobs:
           if not os.path.exists(pe_file):
               open(pe_file, "w", encoding="utf-8").close()
 
-          # 2. Replace the header-generation script with one that always emits a
-          #    valid (empty) header to whatever output path it is given. This is
-          #    the real backstop and it does NOT touch any object-compile rule.
+          # 2. Replace the header-generation script so that BOTH the protected and
+          #    unprotected header rules (which call this same script) emit a valid
+          #    empty header. Per the dumped Makefile, the recipe passes the output
+          #    path as the FIRST argument ($@):
+          #        gen_gki_modules_headers.sh $@ "$(srctree)" <list>
+          #    so we write to $1. kernel/module/Makefile is deliberately NOT edited
+          #    -- the original recipe is correct once this script is benign, and the
+          #    recipe spans backslash-continued lines that must not be split.
           gen_script = "scripts/gen_gki_modules_headers.sh"
           if os.path.exists(gen_script):
               print(">> Neutralizing %s to emit a valid empty header." % gen_script)
               content = (
                   "#!/bin/bash\n"
                   "# Neutralized for SukiSU/SUSFS: emit a valid empty header.\n"
+                  "# Arg 1 is the output header path (per kernel/module/Makefile).\n"
                   'out="$1"\n'
                   'if [ -z "$out" ]; then\n'
-                  '  out="${@: -1}"\n'
-                  "fi\n"
-                  'if [ -z "$out" ] || [ "$out" = "$0" ]; then\n'
                   "  exit 0\n"
                   "fi\n"
                   'mkdir -p "$(dirname "$out")"\n'
@@ -249,41 +250,13 @@ jobs:
               with open(gen_script, "w", encoding="utf-8") as f:
                   f.write(content)
               os.chmod(gen_script, 0o755)
+          else:
+              print(">> [WARN] %s not found; header generation untouched." % gen_script)
 
-          # 3. Surgically fix ONLY broken recipe COMMAND lines in the module
-          #    Makefile. CRITICAL: process line-by-line, never consume following
-          #    lines, so the adjacent gki_module.o compile rule stays intact.
-          #    A recipe command line starts with a TAB. We only rewrite command
-          #    lines that generate the protected-exports header; target/dependency
-          #    lines (no leading tab) and all other recipes are left byte-for-byte.
-          mod_mk = "kernel/module/Makefile"
-          if os.path.exists(mod_mk):
-              print(">> Surgically sanitizing %s (command lines only)" % mod_mk)
-              raw = open(mod_mk, encoding="utf-8", errors="ignore").read()
-              lines = raw.splitlines()
-              out = []
-              changed = 0
-              for line in lines:
-                  is_recipe_cmd = line.startswith("\t")
-                  mentions_pe = ("gki_module_protected_exports" in line
-                                 or "gen_gki_modules_headers" in line)
-                  if is_recipe_cmd and mentions_pe:
-                      # Replace just this command with a safe empty-header create,
-                      # using the rule's own target variable $@ (correct path).
-                      out.append("\t$(Q)mkdir -p $(dir $@); : > $@")
-                      changed += 1
-                      print(">> Rewrote recipe command: %s" % line.strip()[:70])
-                  else:
-                      out.append(line)
-              if changed:
-                  with open(mod_mk, "w", encoding="utf-8") as f:
-                      f.write("\n".join(out) + "\n")
-                  print(">> Rewrote %d protected-exports recipe command line(s)." % changed)
-              else:
-                  print(">> No protected-exports recipe command lines matched; left untouched.")
+          # 3. kernel/module/Makefile is intentionally LEFT UNTOUCHED.
+          print(">> kernel/module/Makefile left intact (script neutralization is sufficient).")
 
-          # 4. Strip protected-exports references from Bazel files (declarative,
-          #    safe — these are not compile rules).
+          # 4. Strip protected-exports references from Bazel files (declarative, safe).
           for bzl_file in ["BUILD.bazel", "modules.bzl"]:
               if os.path.exists(bzl_file):
                   lines = open(bzl_file, encoding="utf-8", errors="ignore").read().splitlines()
