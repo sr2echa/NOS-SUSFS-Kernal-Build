@@ -1,4 +1,4 @@
-name: CLAUDE - Build Nothing OS 4.1 Kernel (SUSFS)
+name: Build Nothing OS 4.1 Kernel (SUSFS)
 
 on:
   workflow_dispatch:
@@ -77,8 +77,6 @@ jobs:
 
           echo "=================================================="
           echo ">> STAGE 1: Install KernelSU-Next (next-susfs branch)"
-          echo ">> This branch defines susfs_is_current_ksu_domain on"
-          echo ">> the KSU side, so no separate KSU patch is needed."
           echo "=================================================="
           curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/refs/heads/next-susfs/kernel/setup.sh" | bash -s next-susfs
 
@@ -88,7 +86,6 @@ jobs:
           echo ">> Available pershoot/susfs4ksu branches:"
           git ls-remote --heads https://gitlab.com/pershoot/susfs4ksu.git | awk '{print $2}' | sed 's#refs/heads/##'
 
-          # Prefer an android15-6.6 branch; fall back to any 6.6 branch.
           SUSFS_BRANCH=$(git ls-remote --heads https://gitlab.com/pershoot/susfs4ksu.git \
             | awk '{print $2}' | sed 's#refs/heads/##' \
             | grep -iE "android15-6\.6" | head -n 1)
@@ -142,8 +139,6 @@ jobs:
           echo ">> Applying GKI patch: $GKI_PATCH"
           patch -p1 --fuzz=3 < "$GKI_PATCH" || true
 
-          # Optional manual-hooks patch (present in pershoot/next-susfs flows).
-          # Needed when kprobe hooks are not used. Applied tolerantly.
           MANUAL_HOOKS=$(find /tmp/susfs4ksu -type f -name "*scope*manual*hooks*.patch" | head -n 1)
           if [ -n "$MANUAL_HOOKS" ]; then
             echo ">> Applying manual hooks patch: $MANUAL_HOOKS"
@@ -152,7 +147,6 @@ jobs:
 
           echo "=================================================="
           echo ">> STAGE 6: Verify the KSU side DEFINES the symbol"
-          echo ">> that previously failed to link."
           echo "=================================================="
           KSU_ROOT=$(find . -maxdepth 1 -type d -name "KernelSU*" | head -n 1)
           if [ -z "$KSU_ROOT" ] && [ -L drivers/kernelsu ]; then
@@ -160,28 +154,46 @@ jobs:
           fi
           echo ">> KSU root: $KSU_ROOT"
 
-          # The symbol must be DEFINED (not just declared) somewhere in the KSU tree.
           if ! grep -rIl "susfs_is_current_ksu_domain" "$KSU_ROOT" >/dev/null 2>&1; then
             echo "[FATAL] susfs_is_current_ksu_domain is NOT present in the KSU tree."
-            echo "        The next-susfs branch did not provide it. This is the"
-            echo "        same class of link failure as before; the KSU/SUSFS"
-            echo "        versions are not aligned for 6.6 yet."
             exit 1
           fi
-          echo ">> Symbol present in KSU tree — link should now succeed."
+          echo ">> Symbol present in KSU tree — link should succeed."
 
           echo "=================================================="
-          echo ">> STAGE 7: Remove protected-export enforcement"
-          echo ">> (otherwise SUSFS symbol changes break Wi-Fi/BT)"
+          echo ">> STAGE 7: Neutralize protected-export ENFORCEMENT"
+          echo ">> (SUSFS changes symbols the KMI list would reject,"
+          echo ">>  which breaks Wi-Fi/BT — but we must keep the"
+          echo ">>  generated header present, just empty.)"
           echo "=================================================="
-          # Strip the protected_exports lists from BUILD.bazel wherever they appear,
-          # and delete the protected-export ABI files. Handles both msm-kernel and
-          # any common/ tree without failing if a path is absent.
+          # Do NOT delete the abi_gki_protected_exports_* files — the kernel
+          # build rule still tries to generate a header from them and dies on
+          # an empty path (touch '': No such file or directory).
+          # Instead, force the generated header to be empty and harmless.
+
+          # 1. Replace the protected-exports source files with empty files
+          #    (present, but listing nothing to protect).
+          find . -type f -name "abi_gki_protected_exports_*" 2>/dev/null | while read -r f; do
+            echo ">> Emptying protected exports file: $f"
+            : > "$f"
+          done
+
+          # 2. Patch the module Makefile rule so the generated header is
+          #    created empty instead of derived from a (now empty) list.
+          MOD_MAKEFILE="kernel/module/Makefile"
+          if [ -f "$MOD_MAKEFILE" ] && grep -q "gki_module_protected_exports.h" "$MOD_MAKEFILE"; then
+            echo ">> Forcing empty gki_module_protected_exports.h generation."
+            # Replace the recipe that touches/derives the protected exports
+            # header with a plain empty-file creation.
+            sed -i 's#\$(obj)/gki_module_protected_exports.h:.*#$(obj)/gki_module_protected_exports.h: FORCE\n\t$(Q)mkdir -p $(dir $@); : > $@#' "$MOD_MAKEFILE" || true
+          fi
+
+          # 3. Drop the protected_exports_list reference from any BUILD.bazel
+          #    so Bazel doesn't require the file as a declared input.
           for BZL in $(grep -rIl "abi_gki_protected_exports" . 2>/dev/null || true); do
             echo ">> Cleaning protected_exports refs in: $BZL"
             sed -i '/abi_gki_protected_exports/d' "$BZL" || true
           done
-          find . -type f -name "abi_gki_protected_exports_*" -print -delete 2>/dev/null || true
 
           echo "=================================================="
           echo ">> STAGE 8: Wire up KSU Kconfig + neutralize fingerprint"
