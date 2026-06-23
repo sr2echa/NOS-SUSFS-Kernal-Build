@@ -70,43 +70,46 @@ jobs:
           ref: sm8735/b/mr
           path: workspace/msm-kernel
 
-      - name: 5. Setup and Patch KernelSU-Next & SUSFS Sources
+      - name: 5. Inject KernelSU-Next & SUSFS Sources
         working-directory: workspace/msm-kernel
         run: |
           set -e
 
-          echo "=================================================="
-          echo ">> STAGE 1: Install KernelSU-Next (next-susfs branch)"
-          echo "=================================================="
-          curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/refs/heads/next-susfs/kernel/setup.sh" | bash -s next-susfs
+          KSU_PIN="1de68a8ed2a09ac575c88d3556c1084937669d84"
+          SUSFS_PIN="a52b8edfe32d40fae7f884d75848b7257c9f91b6"
 
           echo "=================================================="
-          echo ">> STAGE 2: Discover the matching susfs4ksu branch"
+          echo ">> STAGE 1: Install KernelSU-Next, pinned to $KSU_PIN"
           echo "=================================================="
-          echo ">> Available pershoot/susfs4ksu branches:"
-          git ls-remote --heads https://gitlab.com/pershoot/susfs4ksu.git | awk '{print $2}' | sed 's#refs/heads/##'
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
 
-          SUSFS_BRANCH=$(git ls-remote --heads https://gitlab.com/pershoot/susfs4ksu.git \
-            | awk '{print $2}' | sed 's#refs/heads/##' \
-            | grep -iE "android15-6\.6" | head -n 1)
-
-          if [ -z "$SUSFS_BRANCH" ]; then
-            SUSFS_BRANCH=$(git ls-remote --heads https://gitlab.com/pershoot/susfs4ksu.git \
-              | awk '{print $2}' | sed 's#refs/heads/##' \
-              | grep -iE "6\.6" | head -n 1)
+          if [ ! -d KernelSU-Next ]; then
+            echo "[FATAL] KernelSU-Next directory missing after setup." && exit 1
           fi
 
-          if [ -z "$SUSFS_BRANCH" ]; then
-            echo ">> [WARN] No 6.6 branch on pershoot fork; falling back to simonpunk."
-            SUSFS_REPO="https://gitlab.com/simonpunk/susfs4ksu.git"
-            SUSFS_BRANCH="gki-android15-6.6"
-          else
-            SUSFS_REPO="https://gitlab.com/pershoot/susfs4ksu.git"
-          fi
+          echo ">> Forcing KernelSU-Next to the exact proven commit..."
+          (
+            cd KernelSU-Next
+            git fetch --unshallow origin 2>/dev/null || git fetch --all 2>/dev/null || true
+            if git checkout "$KSU_PIN" 2>/dev/null; then
+              echo ">> Pinned KernelSU-Next to $KSU_PIN"
+            else
+              echo ">> [WARN] Could not pin to $KSU_PIN; using setup default (mismatch risk)."
+            fi
+          )
 
-          echo ">> Selected SUSFS repo:   $SUSFS_REPO"
-          echo ">> Selected SUSFS branch: $SUSFS_BRANCH"
-          git clone --depth 1 "$SUSFS_REPO" -b "$SUSFS_BRANCH" /tmp/susfs4ksu
+          echo "=================================================="
+          echo ">> STAGE 2: Clone susfs4ksu, pinned to $SUSFS_PIN"
+          echo "=================================================="
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 /tmp/susfs4ksu
+          (
+            cd /tmp/susfs4ksu
+            if git checkout "$SUSFS_PIN" 2>/dev/null; then
+              echo ">> Pinned susfs4ksu to $SUSFS_PIN"
+            else
+              echo ">> [WARN] Could not pin susfs4ksu to $SUSFS_PIN; using branch HEAD."
+            fi
+          )
 
           echo "=================================================="
           echo ">> STAGE 3: Dump susfs4ksu layout for diagnostics"
@@ -139,14 +142,8 @@ jobs:
           echo ">> Applying GKI patch: $GKI_PATCH"
           patch -p1 --fuzz=3 < "$GKI_PATCH" || true
 
-          MANUAL_HOOKS=$(find /tmp/susfs4ksu -type f -name "*scope*manual*hooks*.patch" | head -n 1)
-          if [ -n "$MANUAL_HOOKS" ]; then
-            echo ">> Applying manual hooks patch: $MANUAL_HOOKS"
-            patch -p1 --fuzz=3 < "$MANUAL_HOOKS" || echo ">> [WARN] manual hooks patch had rejects; continuing."
-          fi
-
           echo "=================================================="
-          echo ">> STAGE 6: Verify the KSU side DEFINES the symbol"
+          echo ">> STAGE 5b: Apply the KSU-side SUSFS patch (now version-matched)"
           echo "=================================================="
           KSU_ROOT=$(find . -maxdepth 1 -type d -name "KernelSU*" | head -n 1)
           if [ -z "$KSU_ROOT" ] && [ -L drivers/kernelsu ]; then
@@ -154,11 +151,26 @@ jobs:
           fi
           echo ">> KSU root: $KSU_ROOT"
 
-          if ! grep -rIl "susfs_is_current_ksu_domain" "$KSU_ROOT" >/dev/null 2>&1; then
-            echo "[FATAL] susfs_is_current_ksu_domain is NOT present in the KSU tree."
+          KSU_PATCH=$(find /tmp/susfs4ksu -type f -name "*enable_susfs_for_ksu*.patch" | head -n 1)
+          if [ -z "$KSU_PATCH" ]; then
+            echo "[FATAL] Could not find 10_enable_susfs_for_ksu.patch in susfs4ksu repo!"
+            find /tmp/susfs4ksu -type f -name "*.patch"
             exit 1
           fi
-          echo ">> Symbol present in KSU tree — link should succeed."
+
+          echo ">> Applying KSU patch from $KSU_ROOT: $KSU_PATCH"
+          ( cd "$KSU_ROOT" && patch -p1 --fuzz=3 < "$KSU_PATCH" ) || \
+            echo ">> [WARN] KSU SUSFS patch reported rejects; continuing to surface the real build result."
+
+          echo "=================================================="
+          echo ">> STAGE 6: Diagnostic — is susfs_is_current_ksu_domain present?"
+          echo "=================================================="
+          if grep -rIl "susfs_is_current_ksu_domain" "$KSU_ROOT" >/dev/null 2>&1; then
+            echo ">> Symbol present in KSU tree — link should succeed."
+          else
+            echo ">> [WARN] Symbol not found by name; v1.5.9 may use a different"
+            echo ">>        identifier. Proceeding; the compile is the real test."
+          fi
 
       - name: 6. Neutralize Protected Exports Enforcements
         working-directory: workspace/msm-kernel
@@ -170,14 +182,12 @@ jobs:
           print(">> STAGE 7: Neutralize protected-export ENFORCEMENT")
           print("==================================================")
 
-          # Backstop configuration target protection map lists
           pe_file = "android/abi_gki_protected_exports_aarch64"
           os.makedirs(os.path.dirname(pe_file), exist_ok=True)
           if not os.path.exists(pe_file):
               with open(pe_file, "w", encoding="utf-8") as f:
                   pass
 
-          # Rewrite build routine recipe logic structures safely
           mod_mk = "kernel/module/Makefile"
           if os.path.exists(mod_mk):
               print(f">> Rewriting protected-exports recipe inside: {mod_mk}")
@@ -189,7 +199,7 @@ jobs:
                   line = lines[i]
                   if target in line and ":" in line and not line.lstrip().startswith("#"):
                       rule_target = line.split(":")[0].rstrip()
-                      out.append(f"{rule_target}: FORCE\n")
+                      out.append(rule_target + ": FORCE\n")
                       out.append("\t$(Q)mkdir -p $(dir $@)\n")
                       out.append("\t$(Q): > $@\n")
                       i += 1
@@ -210,7 +220,6 @@ jobs:
               with open(mod_mk, "w", encoding="utf-8") as f:
                   f.write("".join(out))
 
-          # Override generating tools binary wrapper execution targets
           gen_script = "scripts/gen_gki_modules_headers.sh"
           if os.path.exists(gen_script):
               print(f">> Neutralizing {gen_script} payload logic chains.")
@@ -229,7 +238,6 @@ jobs:
                   f.write(script_content)
               os.chmod(gen_script, 0o755)
 
-          # Eliminate references throughout active bazel packages
           for bzl_file in ["BUILD.bazel", "modules.bzl"]:
               if os.path.exists(bzl_file):
                   lines = open(bzl_file, encoding="utf-8", errors="ignore").read().splitlines()
