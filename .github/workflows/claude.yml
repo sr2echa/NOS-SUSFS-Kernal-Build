@@ -74,10 +74,6 @@ jobs:
         run: |
           set -e
 
-          # SukiSU's driver carries the KSU-side susfs glue. The kernel-VFS layer
-          # (fs/susfs.c + hooks in fs/namei.c etc.) lives in the host tree and is
-          # supplied from susfs4ksu. This pin is the exact commit the proven
-          # SukiSU + SUSFS v2.1.0 build uses.
           SUSFS_PIN="709129bc30aadb6a2a16b813cd49f675c30127dd"
 
           fail_on_rej() {
@@ -210,53 +206,61 @@ jobs:
           echo "===== grep gki_module ====="
           grep -n "gki_module" kernel/module/Makefile || true
 
-      - name: 8. Protected-Exports Neutralization (script-only, Makefile untouched)
+      - name: 8. Protected-Exports Neutralization (emit valid zero-symbol header)
         working-directory: workspace/msm-kernel
         shell: python
         run: |
           import os
 
-          print(">> STAGE 6: Neutralize protected-export ENFORCEMENT (script-only)")
+          print(">> STAGE 6: Neutralize protected-export ENFORCEMENT (zero-symbol header)")
 
-          # 1. Ensure the protected-exports source list exists (empty is valid).
           pe_file = "android/abi_gki_protected_exports_aarch64"
           os.makedirs(os.path.dirname(pe_file), exist_ok=True)
           if not os.path.exists(pe_file):
               open(pe_file, "w", encoding="utf-8").close()
 
-          # 2. Replace the header-generation script so that BOTH the protected and
-          #    unprotected header rules (which call this same script) emit a valid
-          #    empty header. Per the dumped Makefile, the recipe passes the output
-          #    path as the FIRST argument ($@):
-          #        gen_gki_modules_headers.sh $@ "$(srctree)" <list>
-          #    so we write to $1. kernel/module/Makefile is deliberately NOT edited
-          #    -- the original recipe is correct once this script is benign, and the
-          #    recipe spans backslash-continued lines that must not be split.
           gen_script = "scripts/gen_gki_modules_headers.sh"
           if os.path.exists(gen_script):
-              print(">> Neutralizing %s to emit a valid empty header." % gen_script)
-              content = (
-                  "#!/bin/bash\n"
-                  "# Neutralized for SukiSU/SUSFS: emit a valid empty header.\n"
-                  "# Arg 1 is the output header path (per kernel/module/Makefile).\n"
-                  'out="$1"\n'
-                  'if [ -z "$out" ]; then\n'
-                  "  exit 0\n"
-                  "fi\n"
-                  'mkdir -p "$(dirname "$out")"\n'
-                  ': > "$out"\n'
-                  "exit 0\n"
-              )
+              print(">> Neutralizing %s to emit a valid zero-symbol header." % gen_script)
+              content = r'''#!/bin/bash
+              # Neutralized for SukiSU/SUSFS: emit a STRUCTURALLY VALID header with 0 symbols.
+              # Arg 1 = output header path (per kernel/module/Makefile).
+              out="$1"
+              if [ -z "$out" ]; then
+                exit 0
+              fi
+              mkdir -p "$(dirname "$out")"
+              base="$(basename "$out")"
+              
+              if [ "$base" = "gki_module_unprotected.h" ]; then
+                cat > "$out" <<'EOF'
+              #ifndef _GKI_MODULE_UNPROTECTED_H
+              #define _GKI_MODULE_UNPROTECTED_H
+              #define NR_UNPROTECTED_SYMBOLS 0
+              #define MAX_UNPROTECTED_NAME_LEN 1
+              static const char gki_unprotected_symbols[NR_UNPROTECTED_SYMBOLS][MAX_UNPROTECTED_NAME_LEN] = {};
+              #endif
+              EOF
+              else
+                cat > "$out" <<'EOF'
+              #ifndef _GKI_MODULE_PROTECTED_EXPORTS_H
+              #define _GKI_MODULE_PROTECTED_EXPORTS_H
+              #define NR_PROTECTED_EXPORTS_SYMBOLS 0
+              #define MAX_PROTECTED_EXPORTS_NAME_LEN 1
+              static const char gki_protected_exports_symbols[NR_PROTECTED_EXPORTS_SYMBOLS][MAX_PROTECTED_EXPORTS_NAME_LEN] = {};
+              #endif
+              EOF
+              fi
+              exit 0
+              '''
               with open(gen_script, "w", encoding="utf-8") as f:
                   f.write(content)
               os.chmod(gen_script, 0o755)
           else:
               print(">> [WARN] %s not found; header generation untouched." % gen_script)
 
-          # 3. kernel/module/Makefile is intentionally LEFT UNTOUCHED.
-          print(">> kernel/module/Makefile left intact (script neutralization is sufficient).")
+          print(">> kernel/module/Makefile left intact.")
 
-          # 4. Strip protected-exports references from Bazel files (declarative, safe).
           for bzl_file in ["BUILD.bazel", "modules.bzl"]:
               if os.path.exists(bzl_file):
                   lines = open(bzl_file, encoding="utf-8", errors="ignore").read().splitlines()
