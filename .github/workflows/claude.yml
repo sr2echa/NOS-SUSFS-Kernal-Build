@@ -1,4 +1,4 @@
-name: Build Nothing OS 4.1 Kernel (SukiSU Ultra + SUSFS v2.1.0+)
+name: Build Nothing OS 4.1 Kernel (KSU-Next + SUSFS v2.1.0+ via bridge patch)
 
 on:
   push:
@@ -69,30 +69,30 @@ jobs:
           ref: sm8735/b/mr
           path: workspace/msm-kernel
 
-      - name: 5. Integrate SukiSU Ultra (susfs-main, FORCED) + SUSFS VFS (simonpunk)
+      - name: 5. Integrate KSU-Next + SUSFS + WildJames bridge patch
         working-directory: workspace/msm-kernel
         run: |
           set -e
 
-          # STRATEGY (proven on OnePlus Qualcomm android15-6.6, SUSFS v2.1.0+):
-          #   Manager: SukiSU Ultra, `susfs-main` branch. It uses simonpunk's susfs
-          #            API UNCHANGED (unlike pershoot, who altered the signatures and
-          #            caused the core_hook.c mismatch). So its core_hook.c matches
-          #            simonpunk's susfs.h.
-          #   VFS:     simonpunk susfs4ksu gki-android15-6.6 HEAD. Taking BOTH at
-          #            their current main-line heads keeps the manager/susfs versions
-          #            coherent (the lesson from every prior mismatch).
-          #   Hooks:   SukiSU default GKI = kprobes (CONFIG_KPROBES=y,
-          #            CONFIG_KSU_MANUAL_HOOK unset). So we do NOT apply the
-          #            60_scope-minimized_manual_hooks patch.
-          # We FORCE-clone SukiSU ourselves (its setup.sh is a no-op-if-present, the
-          # same trap that kept re-symlinking the wrong driver before).
+          # PROVEN RECIPE (reigadegr / WildKernels, shipping on OnePlus Qualcomm
+          # android15-6.6 with SUSFS v2.x):
+          #   1. rifsxd KernelSU-Next `next` branch (plain driver)
+          #   2. simonpunk susfs4ksu gki-android15-6.6 (VFS layer)
+          #   3. TheWildJames/kernel_patches BRIDGE PATCH — rewrites the KSU-Next
+          #      driver's core_hook.c to DEFINE susfs_is_current_ksu_domain, the
+          #      DATA_ADB_* constants, and the matching susfs signatures. THIS is
+          #      what was missing from every prior build (undefined symbol /
+          #      signature mismatch). Bridge + susfs are both taken current so
+          #      their versions cohere.
+          # All patches apply HERE, before the long compile: a reject fails in
+          # seconds with the exact hunk, not 18 minutes in.
 
           fail_on_rej() {
+            local scope="$1"
             local rejs
-            rejs=$(find . -name "*.rej" -not -path "./.git/*" 2>/dev/null || true)
+            rejs=$(find "$scope" -name "*.rej" -not -path "./.git/*" 2>/dev/null || true)
             if [ -n "$rejs" ]; then
-              echo ">> [FATAL] Patch rejects detected. Dumping and aborting."
+              echo ">> [FATAL] Patch rejects detected under $scope. Dumping and aborting."
               for r in $rejs; do
                 echo "----- REJECT: $r -----"
                 cat "$r"
@@ -108,64 +108,82 @@ jobs:
           sed -i '/kernelsu/d' drivers/Makefile 2>/dev/null || true
           sed -i '\#drivers/kernelsu/Kconfig#d' drivers/Kconfig 2>/dev/null || true
 
-          echo ">> STAGE 1: EXPLICITLY clone SukiSU Ultra (susfs-main branch)"
-          git clone --depth=1 -b susfs-main https://github.com/SukiSU-Ultra/SukiSU-Ultra KernelSU
-          echo ">> Cloned SukiSU Ultra susfs-main @ $(cd KernelSU && git rev-parse --short HEAD)"
-          if [ ! -d KernelSU/kernel ]; then
-            echo ">> [FATAL] SukiSU Ultra clone has no kernel/ dir." && exit 1
-          fi
+          echo ">> STAGE 1: EXPLICITLY clone rifsxd KernelSU-Next (next branch)"
+          git clone --depth=1 -b next https://github.com/KernelSU-Next/KernelSU-Next KernelSU-Next
+          echo ">> Cloned KernelSU-Next next @ $(cd KernelSU-Next && git rev-parse --short HEAD)"
+          [ -d KernelSU-Next/kernel ] || { echo ">> [FATAL] KernelSU-Next has no kernel/ dir"; exit 1; }
 
-          echo ">> STAGE 2: Manually symlink the SukiSU driver into drivers/kernelsu"
-          ln -sf "$(realpath --relative-to=drivers KernelSU/kernel)" drivers/kernelsu
+          echo ">> STAGE 2: Manually symlink the driver into drivers/kernelsu"
+          ln -sf "$(realpath --relative-to=drivers KernelSU-Next/kernel)" drivers/kernelsu
           grep -q "kernelsu" drivers/Makefile || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
           grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig || sed -i '/endmenu/i\source "drivers/kernelsu/Kconfig"' drivers/Kconfig
-          echo ">> Driver symlinked: $(readlink -f drivers/kernelsu)"
 
           echo ">> STAGE 3: Clone susfs4ksu gki-android15-6.6 (simonpunk, HEAD)"
           git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 /tmp/susfs4ksu
           echo ">> susfs4ksu @ $(cd /tmp/susfs4ksu && git rev-parse --short HEAD)"
 
-          echo ">> STAGE 4: Copy SUSFS VFS sources + headers into tree"
+          echo ">> STAGE 4: Clone TheWildJames/kernel_patches (bridge + extras)"
+          git clone --depth=1 https://github.com/TheWildJames/kernel_patches.git /tmp/wildpatches || \
+            git clone --depth=1 https://github.com/WildKernels/kernel_patches.git /tmp/wildpatches
+          echo ">> kernel_patches contents:"
+          find /tmp/wildpatches -name "*.patch" | sort
+
+          echo ">> STAGE 5: Copy SUSFS VFS sources + headers into the tree"
           cp -v /tmp/susfs4ksu/kernel_patches/fs/* fs/
           cp -v /tmp/susfs4ksu/kernel_patches/include/linux/* include/linux/
-
           if ! grep -q "susfs.o" fs/Makefile; then
             echo "obj-y += susfs.o" >> fs/Makefile
             echo "CFLAGS_susfs.o += -Wno-unused-variable -Wno-unused-function -Wno-error" >> fs/Makefile
           fi
 
-          echo ">> STAGE 5: Apply SUSFS VFS patch (50_add_susfs)"
+          echo ">> STAGE 6: Apply the KSU-Next <-> SUSFS BRIDGE patch (the missing piece)"
+          BRIDGE=$(find /tmp/wildpatches -type f -name "*to-KernelSU-Next*.patch" | sort | tail -n 1)
+          [ -z "$BRIDGE" ] && BRIDGE=$(find /tmp/wildpatches -type f -iname "*susfs*kernelsu*next*.patch" | sort | tail -n 1)
+          if [ -z "$BRIDGE" ]; then
+            echo ">> [FATAL] No KSU-Next susfs bridge patch found in kernel_patches." && exit 1
+          fi
+          echo ">> Bridge patch: $BRIDGE"
+          cp "$BRIDGE" ./ksun_susfs_bridge.patch
+          # Bridge patch paths target KernelSU-Next/... ; apply at msm-kernel root.
+          patch -p1 --forward --fuzz=3 < ./ksun_susfs_bridge.patch || true
+          fail_on_rej "KernelSU-Next"
+          fail_on_rej "."
+          # Verify the bridge actually defined the symbol that broke every build.
+          if ! grep -rEn "susfs_is_current_ksu_domain\s*\(" KernelSU-Next/kernel/*.c | grep -vE ";\s*$" >/dev/null; then
+            echo ">> [FATAL] Bridge patch applied but susfs_is_current_ksu_domain is still not DEFINED in the driver."
+            echo ">> Bridge/susfs version mismatch. Dumping occurrences:"
+            grep -rEn "susfs_is_current_ksu_domain" KernelSU-Next/kernel/ || true
+            exit 1
+          fi
+          echo ">> Confirmed: bridge patch DEFINED susfs_is_current_ksu_domain in the driver."
+
+          echo ">> STAGE 7: Apply SUSFS VFS patch (50_add_susfs)"
           GKI_PATCH=$(find /tmp/susfs4ksu -type f -name "50_add_susfs_in_gki-android15-6.6.patch" | head -n 1)
           [ -z "$GKI_PATCH" ] && GKI_PATCH=$(find /tmp/susfs4ksu -type f -name "*.patch" | grep -iE "gki.*6\.6" | head -n 1)
-          if [ -z "$GKI_PATCH" ]; then
-            echo ">> [FATAL] No GKI android15-6.6 SUSFS VFS patch found." && exit 1
-          fi
-          echo ">> Applying VFS patch: $GKI_PATCH"
-          patch -p1 --fuzz=3 < "$GKI_PATCH" || true
-          fail_on_rej
+          [ -z "$GKI_PATCH" ] && { echo ">> [FATAL] No GKI android15-6.6 SUSFS VFS patch found."; exit 1; }
+          echo ">> VFS patch: $GKI_PATCH"
+          patch -p1 --forward --fuzz=3 < "$GKI_PATCH" || true
+          fail_on_rej "."
 
-          # NOTE: deliberately NOT applying 60_scope-minimized_manual_hooks.patch —
-          # SukiSU Ultra defaults to kprobe hooks on GKI, which need no hook patch.
+          echo ">> STAGE 8: NOT stubbing fingerprint (preserve the sensor feature)."
+          echo ">> Nothing vendor drivers (Glyph, cameras, fp, display) build from"
+          echo ">> Nothing's defconfig untouched; we only APPEND configs in step 10."
 
-          echo ">> STAGE 6: Neutralize fingerprint modpost stub"
-          if [ -d drivers/input/fingerprint ]; then
-            echo "obj-y =" > drivers/input/fingerprint/Makefile
-          fi
-
-      - name: 6. Sanity-check KSU driver + SUSFS wiring before the long build
+      - name: 6. Sanity-check driver + SUSFS wiring before the long build
         working-directory: workspace/msm-kernel
         run: |
           set -e
           echo ">> Verifying driver + susfs are wired in"
           [ -e drivers/kernelsu/core_hook.c ] || { echo ">> [FATAL] core_hook.c missing"; exit 1; }
-          [ -e fs/susfs.c ] || { echo ">> [FATAL] fs/susfs.c missing"; exit 1; }
-          [ -e include/linux/susfs.h ] || { echo ">> [FATAL] include/linux/susfs.h missing"; exit 1; }
-          grep -q "susfs.o" fs/Makefile || { echo ">> [FATAL] susfs.o not in fs/Makefile"; exit 1; }
-          grep -q "kernelsu" drivers/Makefile || { echo ">> [FATAL] kernelsu not in drivers/Makefile"; exit 1; }
-          echo ">> Driver: $(readlink -f drivers/kernelsu)"
-          echo ">> SUSFS header version line:"
-          grep -i "SUSFS_VERSION" include/linux/susfs.h || echo "   (version macro not found in header — informational)"
-          echo ">> OK: driver and SUSFS VFS both present and wired."
+          [ -e fs/susfs.c ]                  || { echo ">> [FATAL] fs/susfs.c missing"; exit 1; }
+          [ -e include/linux/susfs.h ]       || { echo ">> [FATAL] include/linux/susfs.h missing"; exit 1; }
+          grep -q "susfs.o" fs/Makefile      || { echo ">> [FATAL] susfs.o not in fs/Makefile"; exit 1; }
+          grep -q "kernelsu" drivers/Makefile|| { echo ">> [FATAL] kernelsu not in drivers/Makefile"; exit 1; }
+          echo ">> Fingerprint driver preserved:"
+          [ -e drivers/input/fingerprint/Makefile ] && head -n 3 drivers/input/fingerprint/Makefile || echo "   (no fingerprint dir in this tree)"
+          echo ">> SUSFS version macro:"
+          grep -i "SUSFS_VERSION" include/linux/susfs.h || echo "   (version macro not found — informational)"
+          echo ">> OK: driver + SUSFS VFS present and wired; fingerprint intact."
 
       - name: 7. Debug - dump module Makefile (ground truth)
         working-directory: workspace/msm-kernel
@@ -254,21 +272,39 @@ jobs:
             rm -rf "$tmpd"
           fi
 
-      - name: 10. Inject KSU + SUSFS + KPM config flags (SukiSU kprobes defaults)
+      - name: 10. Inject KSU + full SUSFS feature flags + KPM (kprobe hooks)
         working-directory: workspace/msm-kernel
         run: |
-          # SukiSU Ultra GKI default = kprobe hooks: CONFIG_KPROBES=y and
-          # CONFIG_KSU_MANUAL_HOOK left UNSET. KPM + KALLSYMS for module patching.
+          # KSU su hooks via KPROBES (default GKI path; no fs/ syscall patching,
+          # so no reject risk on Nothing's tree). SUSFS VFS hiding is inline via
+          # the 50_add_susfs patch regardless of su-hook method.
+          # Full SUSFS feature set mirrors the proven WildKernels/reigadegr config
+          # so SUSFS is actually FUNCTIONAL, not merely compiled.
           find arch/arm64/configs/ -type f \( -name "*_defconfig" -o -name "*.config" -o -name "*.fragment" \) \
             -exec sh -c '
-              echo "CONFIG_KSU=y" >> "$1"
-              echo "CONFIG_KSU_SUSFS=y" >> "$1"
-              echo "CONFIG_KPM=y" >> "$1"
-              echo "CONFIG_KPROBES=y" >> "$1"
-              echo "CONFIG_HAVE_KPROBES=y" >> "$1"
-              echo "CONFIG_KPROBE_EVENTS=y" >> "$1"
-              echo "CONFIG_KALLSYMS=y" >> "$1"
-              echo "CONFIG_KALLSYMS_ALL=y" >> "$1"
+              f="$1"
+              echo "CONFIG_KSU=y" >> "$f"
+              echo "CONFIG_KPROBES=y" >> "$f"
+              echo "CONFIG_HAVE_KPROBES=y" >> "$f"
+              echo "CONFIG_KPROBE_EVENTS=y" >> "$f"
+              echo "CONFIG_KALLSYMS=y" >> "$f"
+              echo "CONFIG_KALLSYMS_ALL=y" >> "$f"
+              echo "CONFIG_KPM=y" >> "$f"
+              echo "CONFIG_KSU_SUSFS=y" >> "$f"
+              echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y" >> "$f"
+              echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> "$f"
+              echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> "$f"
+              echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> "$f"
+              echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> "$f"
+              echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> "$f"
+              echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> "$f"
+              echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y" >> "$f"
+              echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> "$f"
+              echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> "$f"
+              echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> "$f"
+              echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> "$f"
+              echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> "$f"
+              echo "CONFIG_KSU_SUSFS_SUS_MAP=y" >> "$f"
             ' _ {} \;
 
       - name: 11. Prepare Qualcomm Build Package Extensions
@@ -402,6 +438,6 @@ jobs:
       - name: 14. Upload Boot Image
         uses: actions/upload-artifact@v4
         with:
-          name: boot-img-nos4.1-sukisu-susfs
+          name: boot-img-nos4.1-ksunext-susfs-v2
           path: workspace/out_dist/boot.img
           compression-level: 9
