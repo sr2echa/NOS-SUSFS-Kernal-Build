@@ -1,4 +1,4 @@
-name: CLAUDE
+name: (SukiSU + SUSFS)
 
 on:
   workflow_dispatch:
@@ -30,7 +30,6 @@ jobs:
           cd workspace
           echo ">> Initializing Android 6.6 Kernel Manifest wrapper..."
           repo init -u https://android.googlesource.com/kernel/manifest -b common-android15-6.6 --depth=1
-
           echo ">> Syncing manifest environment..."
           repo sync -c -j$(nproc) --no-tags --no-clone-bundle
 
@@ -48,7 +47,6 @@ jobs:
           fi
 
           rm -f WORKSPACE MODULE.bazel
-
           cp "$TARGET_WS" WORKSPACE
           chmod +w WORKSPACE
           echo 'local_repository(name = "nt_project", path = "nt_project")' >> WORKSPACE
@@ -70,109 +68,136 @@ jobs:
           ref: sm8735/b/mr
           path: workspace/msm-kernel
 
-      - name: 5. Inject KernelSU-Next & SUSFS Sources
+      - name: 5. Inject SukiSU and Apply SUSFS Fallback Patch
         working-directory: workspace/msm-kernel
         run: |
           set -e
 
-          KSU_PIN="1de68a8ed2a09ac575c88d3556c1084937669d84"
-          SUSFS_PIN="a52b8edfe32d40fae7f884d75848b7257c9f91b6"
+          SUSFS_PIN="709129bc30aadb6a2a16b813cd49f675c30127dd"
 
-          echo "=================================================="
-          echo ">> STAGE 1: Install KernelSU-Next, pinned to $KSU_PIN"
-          echo "=================================================="
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
-
-          if [ ! -d KernelSU-Next ]; then
-            echo "[FATAL] KernelSU-Next directory missing after setup." && exit 1
-          fi
-
-          echo ">> Forcing KernelSU-Next to the exact proven commit..."
-          (
-            cd KernelSU-Next
-            git fetch --unshallow origin 2>/dev/null || git fetch --all 2>/dev/null || true
-            if git checkout "$KSU_PIN" 2>/dev/null; then
-              echo ">> Pinned KernelSU-Next to $KSU_PIN"
-            else
-              echo ">> [WARN] Could not pin to $KSU_PIN; using setup default (mismatch risk)."
+          fail_on_rej() {
+            local rejs
+            rejs=$(find . -name "*.rej" -not -path "./.git/*" 2>/dev/null || true)
+            if [ -n "$rejs" ]; then
+              echo "=================================================="
+              echo ">> [FATAL] Patch rejects detected. Dumping and aborting."
+              echo "=================================================="
+              for r in $rejs; do
+                echo "----- REJECT: $r -----"
+                cat "$r"
+              done
+              exit 1
             fi
-          )
+          }
 
           echo "=================================================="
-          echo ">> STAGE 2: Clone susfs4ksu, pinned to $SUSFS_PIN"
+          echo ">> STAGE 1: Integrate SukiSU with built-in SUSFS (susfs-main)"
           echo "=================================================="
-          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 /tmp/susfs4ksu
-          (
-            cd /tmp/susfs4ksu
-            if git checkout "$SUSFS_PIN" 2>/dev/null; then
-              echo ">> Pinned susfs4ksu to $SUSFS_PIN"
-            else
-              echo ">> [WARN] Could not pin susfs4ksu to $SUSFS_PIN; using branch HEAD."
-            fi
-          )
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s susfs-main
 
           echo "=================================================="
-          echo ">> STAGE 3: Dump susfs4ksu layout for diagnostics"
+          echo ">> STAGE 2: Detect whether SukiSU already populated kernel-side SUSFS"
           echo "=================================================="
-          find /tmp/susfs4ksu -type f -not -path "*/.git/*" | sort
-
-          echo "=================================================="
-          echo ">> STAGE 4: Copy SUSFS sources into msm-kernel tree"
-          echo "=================================================="
-          cp -v /tmp/susfs4ksu/kernel_patches/fs/* fs/
-          cp -v /tmp/susfs4ksu/kernel_patches/include/linux/* include/linux/
-
-          if ! grep -q "susfs.o" fs/Makefile; then
-            echo "obj-y += susfs.o" >> fs/Makefile
-            echo "CFLAGS_susfs.o += -Wno-unused-variable -Wno-unused-function -Wno-error" >> fs/Makefile
-          fi
-
-          echo "=================================================="
-          echo ">> STAGE 5: Apply the SUSFS GKI VFS patch to msm-kernel"
-          echo "=================================================="
-          GKI_PATCH=$(find /tmp/susfs4ksu -type f -name "*.patch" | grep -iE "gki.*6\.6" | head -n 1)
-          [ -z "$GKI_PATCH" ] && GKI_PATCH=$(find /tmp/susfs4ksu -type f -name "*.patch" | grep -i "gki" | head -n 1)
-
-          if [ -z "$GKI_PATCH" ]; then
-            echo "[FATAL] No GKI SUSFS patch found in susfs4ksu repo!"
-            find /tmp/susfs4ksu -type f -name "*.patch"
-            exit 1
-          fi
-
-          echo ">> Applying GKI patch: $GKI_PATCH"
-          patch -p1 --fuzz=3 < "$GKI_PATCH" || true
-
-          echo "=================================================="
-          echo ">> STAGE 5b: Apply the KSU-side SUSFS patch (now version-matched)"
-          echo "=================================================="
-          KSU_ROOT=$(find . -maxdepth 1 -type d -name "KernelSU*" | head -n 1)
-          if [ -z "$KSU_ROOT" ] && [ -L drivers/kernelsu ]; then
-            KSU_ROOT=$(dirname "$(readlink -f drivers/kernelsu)")
-          fi
-          echo ">> KSU root: $KSU_ROOT"
-
-          KSU_PATCH=$(find /tmp/susfs4ksu -type f -name "*enable_susfs_for_ksu*.patch" | head -n 1)
-          if [ -z "$KSU_PATCH" ]; then
-            echo "[FATAL] Could not find 10_enable_susfs_for_ksu.patch in susfs4ksu repo!"
-            find /tmp/susfs4ksu -type f -name "*.patch"
-            exit 1
-          fi
-
-          echo ">> Applying KSU patch from $KSU_ROOT: $KSU_PATCH"
-          ( cd "$KSU_ROOT" && patch -p1 --fuzz=3 < "$KSU_PATCH" ) || \
-            echo ">> [WARN] KSU SUSFS patch reported rejects; continuing to surface the real build result."
-
-          echo "=================================================="
-          echo ">> STAGE 6: Diagnostic — is susfs_is_current_ksu_domain present?"
-          echo "=================================================="
-          if grep -rIl "susfs_is_current_ksu_domain" "$KSU_ROOT" >/dev/null 2>&1; then
-            echo ">> Symbol present in KSU tree — link should succeed."
+          NEED_VFS_FALLBACK=1
+          if [ -f fs/susfs.c ] && [ -f include/linux/susfs.h ]; then
+            echo ">> SukiSU appears to have installed the kernel-side SUSFS itself."
+            echo ">> Trusting SukiSU's own files (no external patch, avoids version mismatch)."
+            NEED_VFS_FALLBACK=0
           else
-            echo ">> [WARN] Symbol not found by name; v1.5.9 may use a different"
-            echo ">>        identifier. Proceeding; the compile is the real test."
+            echo ">> Kernel-side SUSFS not present; will fall back to pinned susfs4ksu."
           fi
 
-      - name: 6. Neutralize Protected Exports Enforcements
+          if [ "$NEED_VFS_FALLBACK" -eq 1 ]; then
+            echo "=================================================="
+            echo ">> STAGE 3: Clone susfs4ksu (fallback only), pinned to $SUSFS_PIN"
+            echo "=================================================="
+            git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 /tmp/susfs4ksu
+            ( cd /tmp/susfs4ksu && git checkout "$SUSFS_PIN" )
+
+            echo ">> Copying kernel-side SUSFS sources into msm-kernel tree..."
+            cp -v /tmp/susfs4ksu/kernel_patches/fs/* fs/
+            cp -v /tmp/susfs4ksu/kernel_patches/include/linux/* include/linux/
+
+            if ! grep -q "susfs.o" fs/Makefile; then
+              echo "obj-y += susfs.o" >> fs/Makefile
+              echo "CFLAGS_susfs.o += -Wno-unused-variable -Wno-unused-function -Wno-error" >> fs/Makefile
+            fi
+
+            echo "=================================================="
+            echo ">> STAGE 4: Apply GKI VFS patch (fallback only); rejects are FATAL"
+            echo "=================================================="
+            GKI_PATCH=$(find /tmp/susfs4ksu -type f -name "*.patch" | grep -iE "gki.*6\.6" | head -n 1)
+            [ -z "$GKI_PATCH" ] && GKI_PATCH=$(find /tmp/susfs4ksu -type f -name "*.patch" | grep -i "gki" | head -n 1)
+            if [ -z "$GKI_PATCH" ]; then
+              echo ">> [FATAL] No GKI SUSFS patch found." && exit 1
+            fi
+            echo ">> Applying GKI patch: $GKI_PATCH"
+            patch -p1 --fuzz=3 < "$GKI_PATCH" || true
+            fail_on_rej
+          fi
+
+          echo "=================================================="
+          echo ">> STAGE 6: Wire SukiSU Kconfig + neutralize fingerprint"
+          echo "=================================================="
+          if [ -d drivers/kernelsu ] && ! grep -q "kernelsu" drivers/Kconfig; then
+            sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+          fi
+          if [ -d drivers/input/fingerprint ]; then
+            echo "obj-y =" > drivers/input/fingerprint/Makefile
+          fi
+
+      - name: 5b. Reconcile try_umount Signature
+        working-directory: workspace/msm-kernel
+        shell: python
+        run: |
+          import os
+          import re
+          import sys
+
+          print("==================================================")
+          print(">> STAGE 5: Reconcile try_umount signature (defensive net)")
+          print("==================================================")
+
+          ksu_root = ""
+          if os.path.islink("drivers/kernelsu"):
+              ksu_root = os.path.dirname(os.path.realpath("drivers/kernelsu"))
+          else:
+              for item in os.listdir("."):
+                  if os.path.isdir(item) and item.lower().startswith("kernelsu"):
+                      ksu_root = item
+                      break
+
+          if not ksu_root:
+              print(">> SukiSU/KernelSU root directory not found; skipping reconciliation.")
+              sys.exit(0)
+
+          ch_path = ""
+          for root, dirs, files in os.walk(ksu_root):
+              if "core_hook.c" in files:
+                  ch_path = os.path.join(root, "core_hook.c")
+                  break
+
+          if ch_path:
+              print(f">> Scanning {ch_path} for arity-mismatched try_umount calls...")
+              src = open(ch_path, encoding="utf-8", errors="ignore").read()
+
+              four_arg_def = re.search(r'void\s+try_umount\s*\([^)]*\buid_t\s+\w+\s*\)', src)
+              if not four_arg_def:
+                  print(">> Definition is not 4-arg; nothing to reconcile.")
+                  sys.exit(0)
+
+              pattern = re.compile(r'(try_umount\s*\(\s*[^,()]+,\s*(?:true|false)\s*,\s*[A-Za-z0-9_]+)\s*\)')
+              fixed, n = pattern.subn(r'\1, 0)', src)
+              if n:
+                  with open(ch_path, "w", encoding="utf-8") as f:
+                      f.write(fixed)
+                  print(f">> Reconciled {n} three-arg try_umount call(s) to 4-arg (uid=0).")
+              else:
+                  print(">> No 3-arg call sites found; definition/callers already consistent.")
+          else:
+              print(">> core_hook.c not found under resolved root tree layout.")
+
+      - name: 6. Protected-Exports Neutralization
         working-directory: workspace/msm-kernel
         shell: python
         run: |
@@ -225,7 +250,6 @@ jobs:
               print(f">> Neutralizing {gen_script} payload logic chains.")
               script_content = (
                   "#!/bin/bash\n"
-                  "# Neutralized for SUSFS: emit an empty protected-exports header.\n"
                   'out="${@: -1}"\n'
                   'if [ -z "$out" ] || [ "$out" = "$0" ]; then\n'
                   "  exit 0\n"
@@ -246,32 +270,19 @@ jobs:
                       f.write("\n".join(cleaned_lines) + "\n")
                   print(f">> Purged protected references out of: {bzl_file}")
 
-      - name: 7. Configure Kernel Defconfigs and Drivers
+      - name: 7. Inject SukiSU + SUSFS + KPM config flags
         working-directory: workspace/msm-kernel
         run: |
-          echo "=================================================="
-          echo ">> STAGE 8: Wire up KSU Kconfig + neutralize fingerprint"
-          echo "=================================================="
-          if [ -d drivers/kernelsu ] && ! grep -q "kernelsu" drivers/Kconfig; then
-            sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
-          fi
-
-          if [ -d drivers/input/fingerprint ]; then
-            echo "obj-y =" > drivers/input/fingerprint/Makefile
-          fi
-
-          echo "=================================================="
-          echo ">> STAGE 9: Inject KSU + SUSFS config flags"
-          echo "=================================================="
           find arch/arm64/configs/ -type f \( -name "*_defconfig" -o -name "*.config" -o -name "*.fragment" \) \
             -exec sh -c '
               echo "CONFIG_KSU=y" >> "$1"
+              echo "CONFIG_KPM=y" >> "$1"
               echo "CONFIG_KSU_SUSFS=y" >> "$1"
               echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> "$1"
               echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> "$1"
               echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> "$1"
               echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> "$1"
-              echo "CONFIG_KSU_SUSFS_SPOOFER=y" >> "$1"
+              echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> "$1"
               echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> "$1"
               echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> "$1"
             ' _ {} \;
@@ -312,9 +323,7 @@ jobs:
                       break
                   start_idx = match.start()
                   end_idx = match.end()
-                  bracket_count = 0
-                  paren_count = 0
-                  brace_count = 0
+                  bracket_count = paren_count = brace_count = 0
                   while end_idx < len(content):
                       char = content[end_idx]
                       if char == '(': paren_count += 1
@@ -409,6 +418,6 @@ jobs:
       - name: 11. Upload Boot Image
         uses: actions/upload-artifact@v4
         with:
-          name: boot-img-nos4.1-susfs
+          name: boot-img-nos4.1-sukisu-susfs
           path: workspace/out_dist/boot.img
           compression-level: 9
