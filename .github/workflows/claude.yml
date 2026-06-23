@@ -76,14 +76,11 @@ jobs:
 
           # PROVEN RECIPE (reigadegr / WildKernels, shipping on OnePlus Qualcomm
           # android15-6.6 with SUSFS v2.x):
-          #   1. rifsxd KernelSU-Next `next` branch (plain driver)
+          #   1. rifsxd KernelSU-Next default branch (plain driver)
           #   2. simonpunk susfs4ksu gki-android15-6.6 (VFS layer)
           #   3. TheWildJames/kernel_patches BRIDGE PATCH — rewrites the KSU-Next
           #      driver's core_hook.c to DEFINE susfs_is_current_ksu_domain, the
-          #      DATA_ADB_* constants, and the matching susfs signatures. THIS is
-          #      what was missing from every prior build (undefined symbol /
-          #      signature mismatch). Bridge + susfs are both taken current so
-          #      their versions cohere.
+          #      DATA_ADB_* constants, and the matching susfs signatures.
           # All patches apply HERE, before the long compile: a reject fails in
           # seconds with the exact hunk, not 18 minutes in.
 
@@ -108,9 +105,12 @@ jobs:
           sed -i '/kernelsu/d' drivers/Makefile 2>/dev/null || true
           sed -i '\#drivers/kernelsu/Kconfig#d' drivers/Kconfig 2>/dev/null || true
 
-          echo ">> STAGE 1: EXPLICITLY clone rifsxd KernelSU-Next (next branch)"
-          git clone --depth=1 -b next https://github.com/KernelSU-Next/KernelSU-Next KernelSU-Next
-          echo ">> Cloned KernelSU-Next next @ $(cd KernelSU-Next && git rev-parse --short HEAD)"
+          echo ">> STAGE 1: Clone rifsxd KernelSU-Next (DEFAULT branch — no -b, as the official setup.sh does)"
+          # The official KernelSU-Next setup.sh clones with NO branch arg and
+          # derives the default branch dynamically. Hardcoding `-b next` hard-fails
+          # if the branch was renamed; cloning the default cannot "branch-not-found".
+          git clone --depth=1 https://github.com/KernelSU-Next/KernelSU-Next KernelSU-Next
+          echo ">> KernelSU-Next default branch: $(cd KernelSU-Next && git rev-parse --abbrev-ref HEAD) @ $(cd KernelSU-Next && git rev-parse --short HEAD)"
           [ -d KernelSU-Next/kernel ] || { echo ">> [FATAL] KernelSU-Next has no kernel/ dir"; exit 1; }
 
           echo ">> STAGE 2: Manually symlink the driver into drivers/kernelsu"
@@ -119,6 +119,8 @@ jobs:
           grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig || sed -i '/endmenu/i\source "drivers/kernelsu/Kconfig"' drivers/Kconfig
 
           echo ">> STAGE 3: Clone susfs4ksu gki-android15-6.6 (simonpunk, HEAD)"
+          # gki-android15-6.6 is a confirmed branch (cloned successfully in earlier
+          # builds), so -b is safe here, unlike the KSU-Next case.
           git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 /tmp/susfs4ksu
           echo ">> susfs4ksu @ $(cd /tmp/susfs4ksu && git rev-parse --short HEAD)"
 
@@ -144,13 +146,11 @@ jobs:
           fi
           echo ">> Bridge patch: $BRIDGE"
           cp "$BRIDGE" ./ksun_susfs_bridge.patch
-          # Bridge patch paths target KernelSU-Next/... ; apply at msm-kernel root.
           patch -p1 --forward --fuzz=3 < ./ksun_susfs_bridge.patch || true
           fail_on_rej "KernelSU-Next"
           fail_on_rej "."
-          # Verify the bridge actually defined the symbol that broke every build.
           if ! grep -rEn "susfs_is_current_ksu_domain\s*\(" KernelSU-Next/kernel/*.c | grep -vE ";\s*$" >/dev/null; then
-            echo ">> [FATAL] Bridge patch applied but susfs_is_current_ksu_domain is still not DEFINED in the driver."
+            echo ">> [FATAL] Bridge applied but susfs_is_current_ksu_domain still NOT defined in driver."
             echo ">> Bridge/susfs version mismatch. Dumping occurrences:"
             grep -rEn "susfs_is_current_ksu_domain" KernelSU-Next/kernel/ || true
             exit 1
@@ -166,8 +166,8 @@ jobs:
           fail_on_rej "."
 
           echo ">> STAGE 8: NOT stubbing fingerprint (preserve the sensor feature)."
-          echo ">> Nothing vendor drivers (Glyph, cameras, fp, display) build from"
-          echo ">> Nothing's defconfig untouched; we only APPEND configs in step 10."
+          echo ">> Nothing vendor drivers build from Nothing's defconfig untouched;"
+          echo ">> we only APPEND configs in step 10."
 
       - name: 6. Sanity-check driver + SUSFS wiring before the long build
         working-directory: workspace/msm-kernel
