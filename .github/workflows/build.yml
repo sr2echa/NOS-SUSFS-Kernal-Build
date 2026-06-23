@@ -2,6 +2,9 @@ name: Build Nothing OS 4.1 Kernel (SUSFS)
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
 
 permissions:
   contents: read
@@ -96,21 +99,29 @@ jobs:
           fi
 
           echo ">> Patching KernelSU-Next for SUSFS..."
-          if [ -d drivers/kernelsu ]; then
-            cd drivers/kernelsu
-            # Target the specific KernelSU submodule integration patch structure from the cloned repository
+          KSU_ROOT_DIR=""
+          if [ -d KernelSU-Next ]; then
+            KSU_ROOT_DIR="KernelSU-Next"
+          elif [ -d KernelSU ]; then
+            KSU_ROOT_DIR="KernelSU"
+          fi
+
+          if [ -n "$KSU_ROOT_DIR" ]; then
+            cd "$KSU_ROOT_DIR"
             PATCH_FILE=$(find /tmp/susfs4ksu/kernel_patches/KernelSU/ -type f -name "10_enable_susfs_for_ksu.patch" | head -n 1)
             if [ -z "$PATCH_FILE" ]; then
               PATCH_FILE=$(find /tmp/susfs4ksu/kernel_patches/ -type f -name "*ksu*.patch" | head -n 1)
             fi
             
             if [ -n "$PATCH_FILE" ]; then
-              echo ">> Applying target KSU patch: $PATCH_FILE"
+              echo ">> Applying target KSU patch from root: $PATCH_FILE"
               patch -p1 < "$PATCH_FILE"
             else
               echo ">> [FATAL] KernelSU patch file could not be resolved!" && exit 1
             fi
-            cd ../..
+            cd ..
+          else
+            echo ">> [FATAL] KernelSU repository directory structure could not be identified!" && exit 1
           fi
 
           if [ -d drivers/kernelsu ] && ! grep -q "kernelsu" drivers/Kconfig; then
