@@ -19,6 +19,9 @@ jobs:
           remove-dotnet: 'true'
           remove-android: 'true'
           remove-haskell: 'true'
+          
+      - name: 1b. Checkout this repo (provides stock_boot.img)
+        uses: actions/checkout@v4
 
       - name: 2. Install Build Dependencies
         run: |
