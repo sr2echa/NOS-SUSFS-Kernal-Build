@@ -1,4 +1,4 @@
-name: Build Nothing OS 4.1 Kernel (SukiSU + SUSFS)
+name: Build Nothing OS 4.1 Kernel (KSU-Next + SUSFS)
 
 on:
   push:
@@ -69,12 +69,16 @@ jobs:
           ref: sm8735/b/mr
           path: workspace/msm-kernel
 
-      - name: 5. Integrate SukiSU (built-in root) + SUSFS kernel-VFS layer
+      - name: 5. Integrate KSU-Next (v2.0.0 line) + SUSFS kernel-VFS layer (coherent pair)
         working-directory: workspace/msm-kernel
         run: |
           set -e
 
-          SUSFS_PIN="709129bc30aadb6a2a16b813cd49f675c30127dd"
+          # ---- PINNED, CO-RELEASED PAIR (WildKernels KSU-Next v2.0.0 line) ----
+          # susfs4ksu gki-android15-6.6 commit that the v2.0.0 KSU-Next line ships with.
+          SUSFS_PIN="2df41de789026a6422521606402576507c687435"
+          # KSU-Next branch carrying the matching driver-side susfs bridge symbols.
+          KSUN_BRANCH="next"
 
           fail_on_rej() {
             local rejs
@@ -89,58 +93,47 @@ jobs:
             fi
           }
 
-          echo ">> STAGE 1: Integrate SukiSU"
-          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s susfs-main
+          echo ">> STAGE 1: Integrate KernelSU-Next ($KSUN_BRANCH)"
+          curl -LSs "https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh" | bash -s "$KSUN_BRANCH"
 
-          KSU_ROOT=""
-          if [ -L drivers/kernelsu ]; then
-            KSU_ROOT=$(dirname "$(readlink -f drivers/kernelsu)")
+          # Validate the setup actually landed the driver (no silent fallback).
+          if [ ! -d drivers/kernelsu ] && [ ! -L drivers/kernelsu ] && [ ! -d KernelSU-Next ]; then
+            echo ">> [FATAL] KernelSU-Next setup did not install the driver." && exit 1
           fi
-          [ -z "$KSU_ROOT" ] && KSU_ROOT=$(find . -maxdepth 1 -type d -name "KernelSU*" | head -n 1)
-          echo ">> SukiSU root: ${KSU_ROOT:-<not found>}"
+          echo ">> KSU-Next driver present."
 
-          echo ">> STAGE 2: Diagnostic — what did SukiSU's setup install?"
-          find . -path ./.git -prune -o -type f \( -name "susfs*.c" -o -name "susfs*.h" \) -print | sort || true
-          if grep -q "susfs" fs/namei.c 2>/dev/null; then
-            echo "   -- host fs/namei.c already references susfs: YES"
-          else
-            echo "   -- host fs/namei.c already references susfs: NO"
+          echo ">> STAGE 2: Supplying kernel-VFS layer from susfs4ksu @ $SUSFS_PIN"
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 /tmp/susfs4ksu
+          ( cd /tmp/susfs4ksu && git checkout "$SUSFS_PIN" )
+          echo ">> susfs4ksu pinned to $(cd /tmp/susfs4ksu && git rev-parse --short HEAD)"
+
+          # Copy the VFS source + headers into the msm-kernel tree.
+          cp -v /tmp/susfs4ksu/kernel_patches/fs/* fs/
+          cp -v /tmp/susfs4ksu/kernel_patches/include/linux/* include/linux/
+
+          if ! grep -q "susfs.o" fs/Makefile; then
+            echo "obj-y += susfs.o" >> fs/Makefile
+            echo "CFLAGS_susfs.o += -Wno-unused-variable -Wno-unused-function -Wno-error" >> fs/Makefile
           fi
 
-          HOST_VFS_PRESENT=0
-          if [ -f fs/susfs.c ] && grep -q "susfs" fs/namei.c 2>/dev/null; then
-            HOST_VFS_PRESENT=1
+          GKI_PATCH=$(find /tmp/susfs4ksu -type f -name "50_add_susfs_in_gki-android15-6.6.patch" | head -n 1)
+          [ -z "$GKI_PATCH" ] && GKI_PATCH=$(find /tmp/susfs4ksu -type f -name "*.patch" | grep -iE "gki.*6\.6" | head -n 1)
+          if [ -z "$GKI_PATCH" ]; then
+            echo ">> [FATAL] No GKI android15-6.6 SUSFS VFS patch found." && exit 1
           fi
+          echo ">> Applying kernel-VFS patch: $GKI_PATCH"
+          patch -p1 --fuzz=3 < "$GKI_PATCH" || true
+          fail_on_rej
 
-          if [ "$HOST_VFS_PRESENT" -eq 1 ]; then
-            echo ">> Kernel-VFS layer already present; SukiSU covered it. Skipping susfs4ksu."
-          else
-            echo ">> STAGE 3: Supplying kernel-VFS layer from susfs4ksu @ $SUSFS_PIN"
-            git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 /tmp/susfs4ksu
-            ( cd /tmp/susfs4ksu && git checkout "$SUSFS_PIN" )
-
-            [ -f fs/susfs.c ] || cp -v /tmp/susfs4ksu/kernel_patches/fs/* fs/
-            for h in /tmp/susfs4ksu/kernel_patches/include/linux/*; do
-              base=$(basename "$h")
-              [ -f "include/linux/$base" ] || cp -v "$h" "include/linux/$base"
-            done
-
-            if ! grep -q "susfs.o" fs/Makefile; then
-              echo "obj-y += susfs.o" >> fs/Makefile
-              echo "CFLAGS_susfs.o += -Wno-unused-variable -Wno-unused-function -Wno-error" >> fs/Makefile
-            fi
-
-            GKI_PATCH=$(find /tmp/susfs4ksu -type f -name "*.patch" | grep -iE "gki.*6\.6" | head -n 1)
-            [ -z "$GKI_PATCH" ] && GKI_PATCH=$(find /tmp/susfs4ksu -type f -name "*.patch" | grep -i "gki" | head -n 1)
-            if [ -z "$GKI_PATCH" ]; then
-              echo ">> [FATAL] No GKI SUSFS VFS patch found." && exit 1
-            fi
-            echo ">> Applying kernel-VFS patch: $GKI_PATCH"
-            patch -p1 --fuzz=3 < "$GKI_PATCH" || true
+          # KSU-Next's own susfs manual-hook patch, if shipped in the susfs repo.
+          HOOK_PATCH=$(find /tmp/susfs4ksu -type f -name "*scope-minimized_manual_hooks*.patch" | head -n 1)
+          if [ -n "$HOOK_PATCH" ]; then
+            echo ">> Applying KSU manual-hook patch: $HOOK_PATCH"
+            patch -p1 --fuzz=3 < "$HOOK_PATCH" || true
             fail_on_rej
           fi
 
-          echo ">> STAGE 4: Wire SukiSU Kconfig + neutralize fingerprint module"
+          echo ">> STAGE 3: Wire Kconfig + neutralize fingerprint modpost stub"
           if [ -d drivers/kernelsu ] && ! grep -q "kernelsu" drivers/Kconfig; then
             sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
           fi
@@ -156,11 +149,13 @@ jobs:
           import re
           import sys
 
-          print(">> STAGE 5: Reconcile try_umount signature (defensive net)")
+          print(">> Reconcile try_umount signature (defensive net)")
 
           ksu_root = ""
           if os.path.islink("drivers/kernelsu"):
               ksu_root = os.path.dirname(os.path.realpath("drivers/kernelsu"))
+          elif os.path.isdir("KernelSU-Next"):
+              ksu_root = "KernelSU-Next"
           else:
               for item in os.listdir("."):
                   if os.path.isdir(item) and item.lower().startswith("kernelsu"):
@@ -168,7 +163,7 @@ jobs:
                       break
 
           if not ksu_root:
-              print(">> SukiSU/KernelSU root not found; skipping reconciliation.")
+              print(">> KSU root not found; skipping reconciliation.")
               sys.exit(0)
 
           ch_path = ""
@@ -181,9 +176,7 @@ jobs:
               print(">> core_hook.c not found; skipping.")
               sys.exit(0)
 
-          print(">> Scanning %s for arity-mismatched try_umount calls..." % ch_path)
           src = open(ch_path, encoding="utf-8", errors="ignore").read()
-
           four_arg_def = re.search(r'void\s+try_umount\s*\([^)]*\buid_t\s+\w+\s*\)', src)
           if not four_arg_def:
               print(">> Definition is not 4-arg; nothing to reconcile.")
@@ -198,7 +191,48 @@ jobs:
           else:
               print(">> No 3-arg call sites found; already consistent.")
 
-      - name: 7. Debug - dump module Makefile (ground truth)
+      - name: 7. FAIL-FAST GATE — verify susfs symbol coherence BEFORE the long build
+        working-directory: workspace/msm-kernel
+        run: |
+          set -e
+          echo ">> Pre-build coherence gate (seconds, not minutes)"
+
+          # 1. VFS layer must be present in the tree.
+          if [ ! -f fs/susfs.c ]; then
+            echo ">> [FATAL] fs/susfs.c missing — VFS layer not integrated."; exit 1
+          fi
+          if ! grep -q "susfs" fs/namei.c; then
+            echo ">> [FATAL] fs/namei.c has no susfs references — 50_add_susfs patch did not apply."; exit 1
+          fi
+          echo ">> VFS layer present (fs/susfs.c + fs/namei.c hooks)."
+
+          # 2. Every susfs_* symbol REFERENCED by the VFS layer must be DEFINED
+          #    somewhere in the tree (VFS side or KSU driver side). This is the
+          #    exact check that catches the undefined-symbol link error in seconds.
+          REF_SYMS=$(grep -rhoE "susfs_[a-z0-9_]+\s*\(" fs/susfs.c include/linux/susfs*.h 2>/dev/null \
+                     | sed -E 's/\s*\($//' | sort -u)
+
+          MISSING=0
+          for sym in $REF_SYMS; do
+            # A definition looks like: <type> susfs_foo(  ... at line start (not a call).
+            if ! grep -rqE "^[A-Za-z_].*\b${sym}\s*\(" \
+                   fs/ include/linux/ drivers/kernelsu/ KernelSU-Next/ 2>/dev/null; then
+              # Allow symbols that are extern-declared and defined in KSU .c files.
+              if ! grep -rqE "\b${sym}\s*\(" drivers/kernelsu/ KernelSU-Next/ 2>/dev/null; then
+                echo ">> [WARN] No definition found for referenced symbol: $sym"
+                MISSING=$((MISSING+1))
+              fi
+            fi
+          done
+
+          if [ "$MISSING" -gt 0 ]; then
+            echo ">> [FATAL] $MISSING susfs bridge symbol(s) referenced but never defined."
+            echo ">> This is the version-mismatch signature. Aborting before the long build."
+            exit 1
+          fi
+          echo ">> Symbol coherence OK — all referenced susfs_* symbols have definitions."
+
+      - name: 8. Debug - dump module Makefile (ground truth)
         working-directory: workspace/msm-kernel
         run: |
           echo "===== kernel/module/Makefile (numbered) ====="
@@ -206,31 +240,24 @@ jobs:
           echo "===== grep gki_module ====="
           grep -n "gki_module" kernel/module/Makefile || true
 
-      - name: 8. Protected-Exports Neutralization (POSIX-clean zero-symbol header)
+      - name: 9. Protected-Exports Neutralization (POSIX-clean zero-symbol header)
         working-directory: workspace/msm-kernel
         shell: python
         run: |
           import os
 
-          print(">> STAGE 6: Neutralize protected-export ENFORCEMENT (POSIX-clean)")
+          print(">> Neutralize protected-export ENFORCEMENT (POSIX-clean)")
 
           pe_file = "android/abi_gki_protected_exports_aarch64"
           os.makedirs(os.path.dirname(pe_file), exist_ok=True)
           if not os.path.exists(pe_file):
               open(pe_file, "w", encoding="utf-8").close()
 
-          # The Makefile runs this script via $(CONFIG_SHELL), which is dash on the
-          # runner -- NOT bash. The previous version used nested heredocs inside an
-          # if/else block, which dash cannot parse (syntax error: unexpected EOF).
-          # This version is strictly POSIX: no heredocs, no bashisms. It emits each
-          # header line with printf and selects the variant with a case statement.
           gen_script = "scripts/gen_gki_modules_headers.sh"
           if os.path.exists(gen_script):
               print(">> Neutralizing %s (POSIX-clean, dash-safe)." % gen_script)
               content = (
                   "#!/bin/sh\n"
-                  "# Neutralized for SukiSU/SUSFS: emit a STRUCTURALLY VALID header\n"
-                  "# with zero symbols. POSIX sh only (invoked via CONFIG_SHELL=dash).\n"
                   "out=\"$1\"\n"
                   "if [ -z \"$out\" ]; then\n"
                   "    exit 0\n"
@@ -262,13 +289,8 @@ jobs:
               with open(gen_script, "w", encoding="utf-8") as f:
                   f.write(content)
               os.chmod(gen_script, 0o755)
-              # Sanity: confirm parens/fi balance by dumping for the log.
-              print(">> --- emitted gen_gki_modules_headers.sh ---")
-              print(content)
           else:
               print(">> [WARN] %s not found; header generation untouched." % gen_script)
-
-          print(">> kernel/module/Makefile left intact.")
 
           for bzl_file in ["BUILD.bazel", "modules.bzl"]:
               if os.path.exists(bzl_file):
@@ -279,7 +301,25 @@ jobs:
                           f.write("\n".join(cleaned) + "\n")
                       print(">> Purged protected references out of: %s" % bzl_file)
 
-      - name: 9. Inject SukiSU + SUSFS + KPM config flags
+      - name: 10. Validate generated header script (dash + cc syntax check)
+        working-directory: workspace/msm-kernel
+        run: |
+          set -e
+          GEN="scripts/gen_gki_modules_headers.sh"
+          if [ -f "$GEN" ]; then
+            dash -n "$GEN" || { echo ">> [FATAL] $GEN not valid POSIX sh"; exit 1; }
+            tmpd=$(mktemp -d)
+            for hdr in gki_module_protected_exports.h gki_module_unprotected.h; do
+              dash "$GEN" "$tmpd/$hdr" "$PWD" /dev/null
+              echo "#include \"$tmpd/$hdr\"" > "$tmpd/probe.c"
+              echo "int main(void){return 0;}" >> "$tmpd/probe.c"
+              cc -fsyntax-only "$tmpd/probe.c" || { echo ">> [FATAL] generated $hdr does not compile"; exit 1; }
+              echo ">> $hdr: OK"
+            done
+            rm -rf "$tmpd"
+          fi
+
+      - name: 11. Inject KSU + SUSFS + KPM config flags
         working-directory: workspace/msm-kernel
         run: |
           find arch/arm64/configs/ -type f \( -name "*_defconfig" -o -name "*.config" -o -name "*.fragment" \) \
@@ -296,7 +336,7 @@ jobs:
               echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> "$1"
             ' _ {} \;
 
-      - name: 10. Prepare Qualcomm Build Package Extensions
+      - name: 12. Prepare Qualcomm Build Package Extensions
         working-directory: workspace
         run: |
           mkdir -p build
@@ -317,7 +357,7 @@ jobs:
             echo "def define_combined_vm_image(*args, **kwargs): pass" >> build/msm_kernel_extensions.bzl
           fi
 
-      - name: 11. Sanitize Obsolete Parameters & Mock OEM Layers
+      - name: 13. Sanitize Obsolete Parameters & Mock OEM Layers
         working-directory: workspace
         shell: python
         run: |
@@ -418,15 +458,15 @@ jobs:
               for sym, val in symbols.items():
                   f.write("%s = %s\n" % (sym, val))
 
-      - name: 12. Compile the Kernel via Qualcomm Kleaf
+      - name: 14. Compile the Kernel via Qualcomm Kleaf
         working-directory: workspace
         run: |
           echo ">> Commencing Kernel Compilation via Qualcomm Bazel..."
           tools/bazel run //msm-kernel:kernel_aarch64_dist -- --dist_dir=out_dist
 
-      - name: 13. Upload Boot Image
+      - name: 15. Upload Boot Image
         uses: actions/upload-artifact@v4
         with:
-          name: boot-img-nos4.1-sukisu-susfs
+          name: boot-img-nos4.1-ksunext-susfs
           path: workspace/out_dist/boot.img
           compression-level: 9
