@@ -1,4 +1,4 @@
-name: Build Nothing OS 4.1 Kernel (KSU-Next + SUSFS via version-matched fix patches)
+name: Build Nothing OS 4.1 Kernel (KSU-Next dev + SUSFS, matching-latest)
 
 on:
   push:
@@ -69,20 +69,22 @@ jobs:
           ref: sm8735/b/mr
           path: workspace/msm-kernel
 
-      - name: 5. Integrate KSU-Next + SUSFS (version-matched fix patches)
+      - name: 5. Integrate KSU-Next + SUSFS (matching-latest, no version-bridge patches)
         working-directory: workspace/msm-kernel
         run: |
           set -e
 
-          # MODEL (current WildKernels / TheWildJames kernel_patches structure):
-          #   - KernelSU-Next `dev` already has susfs support BUILT IN to its source.
-          #   - simonpunk susfs4ksu provides the kernel VFS layer (fs/susfs.c + headers
-          #     + 50_add_susfs patch).
-          #   - kernel_patches/next/susfs_fix_patches/<VERSION>/ are FIX patches that
-          #     align KSU-Next's built-in susfs code with the exact SUSFS version.
-          # We DETECT the SUSFS version from the header and select the matching fix
-          # folder, apply each fix dry-run-gated (clean-or-skip, never partial), then
-          # assert the bridge symbol is defined BEFORE the long compile.
+          # The previous run PROVED the version-bridge fix patches corrupt the driver:
+          # next/susfs_fix_patches/v2.1.0/fix_sucompat.c.patch fuzzy-applied OLD-API
+          # changes onto dev HEAD's new-API sucompat.c (2-arg ksu_adb_root_handle_execve,
+          # bool vs DEFINE_STATIC_KEY_TRUE, old escape_to_root_for_init) — producing the
+          # redefinition / incomplete-struct / wrong-arity errors at the final compile.
+          # Those patches target a DIFFERENT KernelSU-Next snapshot.
+          #
+          # rifsxd KernelSU-Next `dev` already has susfs support BUILT IN and is kept
+          # current with SUSFS; simonpunk gki-android15-6.6 HEAD is current SUSFS for
+          # this kernel. The matching-latest pair is coherent on its own — so we apply
+          # ONLY the kernel-side 50_add_susfs and NO driver fixups (nothing to misapply).
 
           fail_on_rej() {
             scope="$1"
@@ -94,22 +96,7 @@ jobs:
             fi
           }
 
-          # Apply a KSU-Next patch only if it applies CLEANLY at some -p/-d combo.
-          apply_ksun_patch() {
-            pf="$1"
-            for spec in "KernelSU-Next:1" "KernelSU-Next/kernel:1" "KernelSU-Next:2" ".:1"; do
-              d="${spec%%:*}"; p="${spec##*:}"
-              if patch -d "$d" -p"$p" --forward --dry-run < "$pf" >/dev/null 2>&1; then
-                patch -d "$d" -p"$p" --forward < "$pf" >/dev/null 2>&1
-                echo "   applied: $(basename "$pf")  (-d $d -p$p)"
-                return 0
-              fi
-            done
-            echo "   SKIPPED (no clean apply): $(basename "$pf")"
-            return 0
-          }
-
-          echo ">> STAGE 0: Wipe any pre-existing KSU state (avoid no-op-clone trap)"
+          echo ">> STAGE 0: Wipe any pre-existing KSU state"
           rm -rf KernelSU KernelSU-Next SukiSU-Ultra
           [ -L drivers/kernelsu ] && rm -f drivers/kernelsu || true
           [ -d drivers/kernelsu ] && rm -rf drivers/kernelsu || true
@@ -130,24 +117,24 @@ jobs:
           git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 /tmp/susfs4ksu
           echo ">> susfs4ksu @ $(cd /tmp/susfs4ksu && git rev-parse --short HEAD)"
 
-          echo ">> STAGE 4: Clone TheWildJames/kernel_patches (fix-patch matrix)"
-          git clone --depth=1 https://github.com/TheWildJames/kernel_patches.git /tmp/wildpatches || \
-            git clone --depth=1 https://github.com/WildKernels/kernel_patches.git /tmp/wildpatches
-
-          echo ">> STAGE 5: Copy SUSFS VFS sources + headers, detect SUSFS version"
+          echo ">> STAGE 4: Copy SUSFS VFS sources + headers; verify API surface"
           cp -v /tmp/susfs4ksu/kernel_patches/fs/* fs/
           cp -v /tmp/susfs4ksu/kernel_patches/include/linux/* include/linux/
           if ! grep -q "susfs.o" fs/Makefile; then
             echo "obj-y += susfs.o" >> fs/Makefile
             echo "CFLAGS_susfs.o += -Wno-unused-variable -Wno-unused-function -Wno-error" >> fs/Makefile
           fi
-          SUSFS_RAW=$(grep -hoE 'SUSFS_VERSION[[:space:]]*"[^"]*"' include/linux/susfs.h 2>/dev/null | head -1 || true)
-          SUSFS_VER=$(printf '%s' "$SUSFS_RAW" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
-          [ -z "$SUSFS_VER" ] && SUSFS_VER=$(printf '%s' "$SUSFS_RAW" | grep -oE '[0-9]+\.[0-9]+' | head -1 || true)
-          echo ">> SUSFS header version line: ${SUSFS_RAW:-<none>}"
-          echo ">> Detected SUSFS version: ${SUSFS_VER:-unknown}"
+          echo ">> SUSFS header version: $(grep -hoE 'SUSFS_VERSION[[:space:]]*\"[^\"]*\"' include/linux/susfs.h 2>/dev/null | head -1 || echo unknown)"
+          echo ">> Diagnostic — do the susfs headers declare what the driver references?"
+          for sym in susfs_is_current_proc_umounted susfs_set_current_proc_umounted SUSFS_MAX_LEN_PATHNAME; do
+            if grep -rqs "$sym" include/linux/susfs.h include/linux/susfs_def.h; then
+              echo "   present in susfs headers: $sym"
+            else
+              echo "   NOT in susfs headers: $sym  (would indicate dev<->susfs drift)"
+            fi
+          done
 
-          echo ">> STAGE 6: Apply SUSFS VFS patch (50_add_susfs, kernel side)"
+          echo ">> STAGE 5: Apply SUSFS VFS patch (50_add_susfs, kernel side)"
           GKI_PATCH=$(find /tmp/susfs4ksu -type f -name "50_add_susfs_in_gki-android15-6.6.patch" | head -n 1)
           [ -z "$GKI_PATCH" ] && GKI_PATCH=$(find /tmp/susfs4ksu -type f -name "*.patch" | grep -iE "gki.*6\.6" | head -n 1)
           [ -z "$GKI_PATCH" ] && { echo ">> [FATAL] No GKI android15-6.6 SUSFS VFS patch found."; exit 1; }
@@ -155,54 +142,25 @@ jobs:
           patch -p1 --forward --fuzz=3 < "$GKI_PATCH" || true
           fail_on_rej "."
 
-          echo ">> STAGE 7: Apply version-matched KSU-Next susfs fix patches"
-          FIXBASE="/tmp/wildpatches/next/susfs_fix_patches"
-          FIXDIR=""
-          if [ -n "$SUSFS_VER" ] && [ -d "$FIXBASE/v$SUSFS_VER" ]; then
-            FIXDIR="$FIXBASE/v$SUSFS_VER"
-          else
-            FIXDIR=$(ls -d "$FIXBASE"/v*/ 2>/dev/null | sort -V | tail -1)
-            echo ">> [WARN] No exact v$SUSFS_VER fix folder; falling back to: ${FIXDIR:-NONE}"
-          fi
-          echo ">> Fix-patch folder: ${FIXDIR:-NONE}"
-          if [ -n "$FIXDIR" ] && [ -d "$FIXDIR" ]; then
-            for pf in "$FIXDIR"/*.patch; do
-              [ -e "$pf" ] || continue
-              case "$(basename "$pf")" in
-                overwrite_hook_mode.patch|multi_manager.patch|multi_sepolicy_fix.patch|ksu_toolkit.patch)
-                  echo "   skipping optional/feature patch: $(basename "$pf")"; continue ;;
-              esac
-              apply_ksun_patch "$pf"
-            done
-          else
-            echo ">> [WARN] No fix-patch folder; relying solely on KSU-Next built-in susfs."
-          fi
-
-          echo ">> STAGE 8: CANARY — verify susfs_is_current_ksu_domain is DEFINED"
-          echo "   (occurrences across driver + kernel:)"
-          grep -rn "susfs_is_current_ksu_domain" KernelSU-Next/ security/ fs/ 2>/dev/null | head -50 || true
+          echo ">> STAGE 6: CANARY — verify susfs_is_current_ksu_domain is DEFINED (built-in)"
+          grep -rn "susfs_is_current_ksu_domain" KernelSU-Next/ security/ fs/ 2>/dev/null | head -30 || true
           HITS=$(grep -rln "susfs_is_current_ksu_domain" KernelSU-Next/ security/ fs/ 2>/dev/null | grep -E '\.c$' | grep -vE '^fs/susfs\.c$' || true)
           if [ -z "$HITS" ]; then
-            echo ">> [FATAL] susfs_is_current_ksu_domain has NO definition in any .c outside fs/susfs.c."
-            echo ">>         It will be UNDEFINED at the final link (exactly build #6's failure)."
-            echo ">>         KSU-Next dev and SUSFS ${SUSFS_VER:-?} are not coherent with these fixes."
+            echo ">> [FATAL] susfs_is_current_ksu_domain has no definition outside fs/susfs.c."
+            echo ">>         dev's built-in susfs is absent/disabled; it would be undefined at link."
             exit 1
           fi
-          echo ">> CANARY OK — definition present in:"
+          echo ">> CANARY OK — defined in:"
           echo "$HITS"
 
-          echo ">> STAGE 9: NOT stubbing fingerprint (preserve the sensor feature)."
-          echo ">> Nothing vendor drivers build from Nothing's defconfig untouched;"
-          echo ">> we only APPEND configs in step 10."
+          echo ">> STAGE 7: NOT stubbing fingerprint (preserve the sensor feature)."
+          echo ">> Nothing vendor drivers build from Nothing's defconfig untouched."
 
       - name: 6. Sanity-check driver + SUSFS wiring before the long build
         working-directory: workspace/msm-kernel
         run: |
           set -e
           echo ">> Verifying driver + susfs are wired in"
-          # KernelSU-Next 'dev' refactored core_hook.c into multiple files
-          # (sucompat.c, supercall.c, setuid_hook.c, ...). Check for the driver
-          # dir + any .c source, not a specific (version-dependent) filename.
           if ! ls drivers/kernelsu/*.c >/dev/null 2>&1; then
             echo ">> [FATAL] no .c sources under drivers/kernelsu (symlink broken or empty)"
             ls -la drivers/kernelsu || true
@@ -217,7 +175,7 @@ jobs:
           echo ">> Fingerprint driver preserved:"
           [ -e drivers/input/fingerprint/Makefile ] && head -n 3 drivers/input/fingerprint/Makefile || echo "   (no fingerprint dir in this tree)"
           echo ">> OK: driver + SUSFS VFS present and wired; fingerprint intact."
-          
+
       - name: 7. Debug - dump module Makefile (ground truth)
         working-directory: workspace/msm-kernel
         run: |
