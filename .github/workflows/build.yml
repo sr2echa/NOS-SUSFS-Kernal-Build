@@ -86,6 +86,8 @@ jobs:
           
           if ! grep -q "susfs.o" fs/Makefile; then
             echo "obj-y += susfs.o" >> fs/Makefile
+            # Fixes compilation breaks by dropping strict unused parameter flags explicitly for susfs components
+            echo "CFLAGS_susfs.o += -Wno-unused-variable -Wno-error" >> fs/Makefile
           fi
 
           echo ">> Applying SUSFS core VFS kernel patches..."
