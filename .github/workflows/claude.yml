@@ -1,6 +1,7 @@
-name: (SukiSU + SUSFS)
+name: Build Nothing OS 4.1 Kernel (SukiSU + SUSFS)
 
 on:
+  push:
   workflow_dispatch:
 
 permissions:
@@ -68,20 +69,23 @@ jobs:
           ref: sm8735/b/mr
           path: workspace/msm-kernel
 
-      - name: 5. Inject SukiSU and Apply SUSFS Fallback Patch
+      - name: 5. Integrate SukiSU (built-in root) + SUSFS kernel-VFS layer
         working-directory: workspace/msm-kernel
         run: |
           set -e
 
+          # SukiSU's driver carries the KSU-side susfs glue (the part that used to
+          # break via 10_enable_susfs_for_ksu.patch). The kernel-VFS layer
+          # (fs/susfs.c + hooks in fs/namei.c etc.) lives in the host tree and
+          # cannot ship inside the SukiSU driver, so it comes from susfs4ksu.
+          # This pin is the exact commit the proven SukiSU + SUSFS v2.1.0 build uses.
           SUSFS_PIN="709129bc30aadb6a2a16b813cd49f675c30127dd"
 
           fail_on_rej() {
             local rejs
             rejs=$(find . -name "*.rej" -not -path "./.git/*" 2>/dev/null || true)
             if [ -n "$rejs" ]; then
-              echo "=================================================="
               echo ">> [FATAL] Patch rejects detected. Dumping and aborting."
-              echo "=================================================="
               for r in $rejs; do
                 echo "----- REJECT: $r -----"
                 cat "$r"
@@ -90,55 +94,59 @@ jobs:
             fi
           }
 
-          echo "=================================================="
-          echo ">> STAGE 1: Integrate SukiSU with built-in SUSFS (susfs-main)"
-          echo "=================================================="
+          echo ">> STAGE 1: Integrate SukiSU (susfs-main = built-in KSU-side susfs)"
           curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s susfs-main
 
-          echo "=================================================="
-          echo ">> STAGE 2: Detect whether SukiSU already populated kernel-side SUSFS"
-          echo "=================================================="
-          NEED_VFS_FALLBACK=1
-          if [ -f fs/susfs.c ] && [ -f include/linux/susfs.h ]; then
-            echo ">> SukiSU appears to have installed the kernel-side SUSFS itself."
-            echo ">> Trusting SukiSU's own files (no external patch, avoids version mismatch)."
-            NEED_VFS_FALLBACK=0
+          KSU_ROOT=""
+          if [ -L drivers/kernelsu ]; then
+            KSU_ROOT=$(dirname "$(readlink -f drivers/kernelsu)")
+          fi
+          [ -z "$KSU_ROOT" ] && KSU_ROOT=$(find . -maxdepth 1 -type d -name "KernelSU*" | head -n 1)
+          echo ">> SukiSU root: ${KSU_ROOT:-<not found>}"
+
+          echo ">> STAGE 2: Diagnostic — what did SukiSU's setup actually install?"
+          find . -path ./.git -prune -o -type f \( -name "susfs*.c" -o -name "susfs*.h" \) -print | sort || true
+          if grep -q "susfs" fs/namei.c 2>/dev/null; then
+            echo "   -- host fs/namei.c already references susfs: YES"
           else
-            echo ">> Kernel-side SUSFS not present; will fall back to pinned susfs4ksu."
+            echo "   -- host fs/namei.c already references susfs: NO"
           fi
 
-          if [ "$NEED_VFS_FALLBACK" -eq 1 ]; then
-            echo "=================================================="
-            echo ">> STAGE 3: Clone susfs4ksu (fallback only), pinned to $SUSFS_PIN"
-            echo "=================================================="
+          HOST_VFS_PRESENT=0
+          if [ -f fs/susfs.c ] && grep -q "susfs" fs/namei.c 2>/dev/null; then
+            HOST_VFS_PRESENT=1
+          fi
+
+          if [ "$HOST_VFS_PRESENT" -eq 1 ]; then
+            echo ">> Kernel-VFS layer already present; SukiSU's setup covered it."
+            echo ">> Skipping susfs4ksu (avoids duplicate susfs.c / double-patch)."
+          else
+            echo ">> STAGE 3: Supplying kernel-VFS layer from susfs4ksu @ $SUSFS_PIN"
             git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 /tmp/susfs4ksu
             ( cd /tmp/susfs4ksu && git checkout "$SUSFS_PIN" )
 
-            echo ">> Copying kernel-side SUSFS sources into msm-kernel tree..."
-            cp -v /tmp/susfs4ksu/kernel_patches/fs/* fs/
-            cp -v /tmp/susfs4ksu/kernel_patches/include/linux/* include/linux/
+            [ -f fs/susfs.c ] || cp -v /tmp/susfs4ksu/kernel_patches/fs/* fs/
+            for h in /tmp/susfs4ksu/kernel_patches/include/linux/*; do
+              base=$(basename "$h")
+              [ -f "include/linux/$base" ] || cp -v "$h" "include/linux/$base"
+            done
 
             if ! grep -q "susfs.o" fs/Makefile; then
               echo "obj-y += susfs.o" >> fs/Makefile
               echo "CFLAGS_susfs.o += -Wno-unused-variable -Wno-unused-function -Wno-error" >> fs/Makefile
             fi
 
-            echo "=================================================="
-            echo ">> STAGE 4: Apply GKI VFS patch (fallback only); rejects are FATAL"
-            echo "=================================================="
             GKI_PATCH=$(find /tmp/susfs4ksu -type f -name "*.patch" | grep -iE "gki.*6\.6" | head -n 1)
             [ -z "$GKI_PATCH" ] && GKI_PATCH=$(find /tmp/susfs4ksu -type f -name "*.patch" | grep -i "gki" | head -n 1)
             if [ -z "$GKI_PATCH" ]; then
-              echo ">> [FATAL] No GKI SUSFS patch found." && exit 1
+              echo ">> [FATAL] No GKI SUSFS VFS patch found." && exit 1
             fi
-            echo ">> Applying GKI patch: $GKI_PATCH"
+            echo ">> Applying kernel-VFS patch: $GKI_PATCH"
             patch -p1 --fuzz=3 < "$GKI_PATCH" || true
             fail_on_rej
           fi
 
-          echo "=================================================="
-          echo ">> STAGE 6: Wire SukiSU Kconfig + neutralize fingerprint"
-          echo "=================================================="
+          echo ">> STAGE 4: Wire SukiSU Kconfig + neutralize fingerprint module"
           if [ -d drivers/kernelsu ] && ! grep -q "kernelsu" drivers/Kconfig; then
             sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
           fi
@@ -146,7 +154,7 @@ jobs:
             echo "obj-y =" > drivers/input/fingerprint/Makefile
           fi
 
-      - name: 5b. Reconcile try_umount Signature
+      - name: 6. Reconcile try_umount Signature (defensive net)
         working-directory: workspace/msm-kernel
         shell: python
         run: |
@@ -154,9 +162,7 @@ jobs:
           import re
           import sys
 
-          print("==================================================")
           print(">> STAGE 5: Reconcile try_umount signature (defensive net)")
-          print("==================================================")
 
           ksu_root = ""
           if os.path.islink("drivers/kernelsu"):
@@ -168,7 +174,7 @@ jobs:
                       break
 
           if not ksu_root:
-              print(">> SukiSU/KernelSU root directory not found; skipping reconciliation.")
+              print(">> SukiSU/KernelSU root not found; skipping reconciliation.")
               sys.exit(0)
 
           ch_path = ""
@@ -177,80 +183,62 @@ jobs:
                   ch_path = os.path.join(root, "core_hook.c")
                   break
 
-          if ch_path:
-              print(f">> Scanning {ch_path} for arity-mismatched try_umount calls...")
-              src = open(ch_path, encoding="utf-8", errors="ignore").read()
+          if not ch_path:
+              print(">> core_hook.c not found; skipping.")
+              sys.exit(0)
 
-              four_arg_def = re.search(r'void\s+try_umount\s*\([^)]*\buid_t\s+\w+\s*\)', src)
-              if not four_arg_def:
-                  print(">> Definition is not 4-arg; nothing to reconcile.")
-                  sys.exit(0)
+          print(">> Scanning %s for arity-mismatched try_umount calls..." % ch_path)
+          src = open(ch_path, encoding="utf-8", errors="ignore").read()
 
-              pattern = re.compile(r'(try_umount\s*\(\s*[^,()]+,\s*(?:true|false)\s*,\s*[A-Za-z0-9_]+)\s*\)')
-              fixed, n = pattern.subn(r'\1, 0)', src)
-              if n:
-                  with open(ch_path, "w", encoding="utf-8") as f:
-                      f.write(fixed)
-                  print(f">> Reconciled {n} three-arg try_umount call(s) to 4-arg (uid=0).")
-              else:
-                  print(">> No 3-arg call sites found; definition/callers already consistent.")
+          four_arg_def = re.search(r'void\s+try_umount\s*\([^)]*\buid_t\s+\w+\s*\)', src)
+          if not four_arg_def:
+              print(">> Definition is not 4-arg; nothing to reconcile.")
+              sys.exit(0)
+
+          pattern = re.compile(r'(try_umount\s*\(\s*[^,()]+,\s*(?:true|false)\s*,\s*[A-Za-z0-9_]+)\s*\)')
+          fixed, n = pattern.subn(r'\1, 0)', src)
+          if n:
+              with open(ch_path, "w", encoding="utf-8") as f:
+                  f.write(fixed)
+              print(">> Reconciled %d three-arg try_umount call(s) to 4-arg (uid=0)." % n)
           else:
-              print(">> core_hook.c not found under resolved root tree layout.")
+              print(">> No 3-arg call sites found; already consistent.")
 
-      - name: 6. Protected-Exports Neutralization
+      - name: 7. Debug - dump module Makefile (ground truth for Stage 6)
+        working-directory: workspace/msm-kernel
+        run: |
+          echo "===== kernel/module/Makefile (numbered) ====="
+          cat -n kernel/module/Makefile || true
+          echo "===== grep gki_module ====="
+          grep -n "gki_module" kernel/module/Makefile || true
+
+      - name: 8. Protected-Exports Neutralization (surgical, single-line only)
         working-directory: workspace/msm-kernel
         shell: python
         run: |
           import os
 
-          print("==================================================")
-          print(">> STAGE 7: Neutralize protected-export ENFORCEMENT")
-          print("==================================================")
+          print(">> STAGE 6: Neutralize protected-export ENFORCEMENT (single-line only)")
 
+          # 1. Ensure the protected-exports source list exists (empty is valid).
           pe_file = "android/abi_gki_protected_exports_aarch64"
           os.makedirs(os.path.dirname(pe_file), exist_ok=True)
           if not os.path.exists(pe_file):
-              with open(pe_file, "w", encoding="utf-8") as f:
-                  pass
+              open(pe_file, "w", encoding="utf-8").close()
 
-          mod_mk = "kernel/module/Makefile"
-          if os.path.exists(mod_mk):
-              print(f">> Rewriting protected-exports recipe inside: {mod_mk}")
-              lines = open(mod_mk, encoding="utf-8", errors="ignore").read().splitlines(keepends=True)
-              out = []
-              i = 0
-              target = "gki_module_protected_exports.h"
-              while i < len(lines):
-                  line = lines[i]
-                  if target in line and ":" in line and not line.lstrip().startswith("#"):
-                      rule_target = line.split(":")[0].rstrip()
-                      out.append(rule_target + ": FORCE\n")
-                      out.append("\t$(Q)mkdir -p $(dir $@)\n")
-                      out.append("\t$(Q): > $@\n")
-                      i += 1
-                      while i < len(lines) and (lines[i].startswith("\t") or lines[i].strip() == ""):
-                          if lines[i].strip() == "":
-                              j = i + 1
-                              while j < len(lines) and lines[j].strip() == "":
-                                  j += 1
-                              if j < len(lines) and lines[j].startswith("\t"):
-                                  i += 1
-                                  continue
-                              else:
-                                  break
-                          i += 1
-                      continue
-                  out.append(line)
-                  i += 1
-              with open(mod_mk, "w", encoding="utf-8") as f:
-                  f.write("".join(out))
-
+          # 2. Replace the header-generation script with one that always emits a
+          #    valid (empty) header to whatever output path it is given. This is
+          #    the real backstop and it does NOT touch any object-compile rule.
           gen_script = "scripts/gen_gki_modules_headers.sh"
           if os.path.exists(gen_script):
-              print(f">> Neutralizing {gen_script} payload logic chains.")
-              script_content = (
+              print(">> Neutralizing %s to emit a valid empty header." % gen_script)
+              content = (
                   "#!/bin/bash\n"
-                  'out="${@: -1}"\n'
+                  "# Neutralized for SukiSU/SUSFS: emit a valid empty header.\n"
+                  'out="$1"\n'
+                  'if [ -z "$out" ]; then\n'
+                  '  out="${@: -1}"\n'
+                  "fi\n"
                   'if [ -z "$out" ] || [ "$out" = "$0" ]; then\n'
                   "  exit 0\n"
                   "fi\n"
@@ -259,18 +247,53 @@ jobs:
                   "exit 0\n"
               )
               with open(gen_script, "w", encoding="utf-8") as f:
-                  f.write(script_content)
+                  f.write(content)
               os.chmod(gen_script, 0o755)
 
+          # 3. Surgically fix ONLY broken recipe COMMAND lines in the module
+          #    Makefile. CRITICAL: process line-by-line, never consume following
+          #    lines, so the adjacent gki_module.o compile rule stays intact.
+          #    A recipe command line starts with a TAB. We only rewrite command
+          #    lines that generate the protected-exports header; target/dependency
+          #    lines (no leading tab) and all other recipes are left byte-for-byte.
+          mod_mk = "kernel/module/Makefile"
+          if os.path.exists(mod_mk):
+              print(">> Surgically sanitizing %s (command lines only)" % mod_mk)
+              raw = open(mod_mk, encoding="utf-8", errors="ignore").read()
+              lines = raw.splitlines()
+              out = []
+              changed = 0
+              for line in lines:
+                  is_recipe_cmd = line.startswith("\t")
+                  mentions_pe = ("gki_module_protected_exports" in line
+                                 or "gen_gki_modules_headers" in line)
+                  if is_recipe_cmd and mentions_pe:
+                      # Replace just this command with a safe empty-header create,
+                      # using the rule's own target variable $@ (correct path).
+                      out.append("\t$(Q)mkdir -p $(dir $@); : > $@")
+                      changed += 1
+                      print(">> Rewrote recipe command: %s" % line.strip()[:70])
+                  else:
+                      out.append(line)
+              if changed:
+                  with open(mod_mk, "w", encoding="utf-8") as f:
+                      f.write("\n".join(out) + "\n")
+                  print(">> Rewrote %d protected-exports recipe command line(s)." % changed)
+              else:
+                  print(">> No protected-exports recipe command lines matched; left untouched.")
+
+          # 4. Strip protected-exports references from Bazel files (declarative,
+          #    safe — these are not compile rules).
           for bzl_file in ["BUILD.bazel", "modules.bzl"]:
               if os.path.exists(bzl_file):
                   lines = open(bzl_file, encoding="utf-8", errors="ignore").read().splitlines()
-                  cleaned_lines = [l for l in lines if "abi_gki_protected_exports" not in l]
-                  with open(bzl_file, "w", encoding="utf-8") as f:
-                      f.write("\n".join(cleaned_lines) + "\n")
-                  print(f">> Purged protected references out of: {bzl_file}")
+                  cleaned = [l for l in lines if "abi_gki_protected_exports" not in l]
+                  if len(cleaned) != len(lines):
+                      with open(bzl_file, "w", encoding="utf-8") as f:
+                          f.write("\n".join(cleaned) + "\n")
+                      print(">> Purged protected references out of: %s" % bzl_file)
 
-      - name: 7. Inject SukiSU + SUSFS + KPM config flags
+      - name: 9. Inject SukiSU + SUSFS + KPM config flags
         working-directory: workspace/msm-kernel
         run: |
           find arch/arm64/configs/ -type f \( -name "*_defconfig" -o -name "*.config" -o -name "*.fragment" \) \
@@ -287,7 +310,7 @@ jobs:
               echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> "$1"
             ' _ {} \;
 
-      - name: 8. Prepare Qualcomm Build Package Extensions
+      - name: 10. Prepare Qualcomm Build Package Extensions
         working-directory: workspace
         run: |
           mkdir -p build
@@ -308,7 +331,7 @@ jobs:
             echo "def define_combined_vm_image(*args, **kwargs): pass" >> build/msm_kernel_extensions.bzl
           fi
 
-      - name: 9. Sanitize Obsolete Parameters & Mock OEM Layers
+      - name: 11. Sanitize Obsolete Parameters & Mock OEM Layers
         working-directory: workspace
         shell: python
         run: |
@@ -367,11 +390,11 @@ jobs:
                               content = content.replace("exit $RES", "exit 0")
                               mutated = True
                           if mutated:
-                              print(f"[*] Neutralized defconfig validation in: {p}")
+                              print("[*] Neutralized defconfig validation in: %s" % p)
                               with open(p, "w", encoding="utf-8") as f:
                                   f.write(content)
                       except Exception as e:
-                          print(f"File patching error: {e}")
+                          print("File patching error: %s" % e)
 
           for root, dirs, files in os.walk("msm-kernel"):
               for file in files:
@@ -403,19 +426,19 @@ jobs:
                               with open(fn, "w", encoding="utf-8") as f:
                                   f.write(content)
                       except Exception as e:
-                          print(f"[!] Error processing {fn}: {e}")
+                          print("[!] Error processing %s: %s" % (fn, e))
 
           with open("nt_project/dict.bzl", "w") as f:
               for sym, val in symbols.items():
-                  f.write(f"{sym} = {val}\n")
+                  f.write("%s = %s\n" % (sym, val))
 
-      - name: 10. Compile the Kernel via Qualcomm Kleaf
+      - name: 12. Compile the Kernel via Qualcomm Kleaf
         working-directory: workspace
         run: |
           echo ">> Commencing Kernel Compilation via Qualcomm Bazel..."
           tools/bazel run //msm-kernel:kernel_aarch64_dist -- --dist_dir=out_dist
 
-      - name: 11. Upload Boot Image
+      - name: 13. Upload Boot Image
         uses: actions/upload-artifact@v4
         with:
           name: boot-img-nos4.1-sukisu-susfs
