@@ -70,7 +70,7 @@ jobs:
           ref: sm8735/b/mr
           path: workspace/msm-kernel
 
-      - name: 5. Inject KernelSU-Next (next-susfs) & SUSFS
+      - name: 5. Setup and Patch KernelSU-Next & SUSFS Sources
         working-directory: workspace/msm-kernel
         run: |
           set -e
@@ -160,83 +160,87 @@ jobs:
           fi
           echo ">> Symbol present in KSU tree — link should succeed."
 
-          echo "=================================================="
-          echo ">> STAGE 7: Neutralize protected-export ENFORCEMENT"
-          echo "=================================================="
-          GEN_SCRIPT="scripts/gen_gki_modules_headers.sh"
-          if [ -f "$GEN_SCRIPT" ]; then
-            echo ">> Found $GEN_SCRIPT — checking how it is invoked."
-            grep -n "gki_module_protected_exports" "$GEN_SCRIPT" || true
-            grep -n "gki_module_protected_exports" kernel/module/Makefile || true
-          fi
+      - name: 6. Neutralize Protected Exports Enforcements
+        working-directory: workspace/msm-kernel
+        shell: python
+        run: |
+          import os
 
-          PE_FILE="android/abi_gki_protected_exports_aarch64"
-          if [ ! -f "$PE_FILE" ]; then
-            mkdir -p android
-            : > "$PE_FILE"
-          fi
+          print("==================================================")
+          print(">> STAGE 7: Neutralize protected-export ENFORCEMENT")
+          print("==================================================")
 
-          MOD_MK="kernel/module/Makefile"
-          if [ -f "$MOD_MK" ]; then
-            echo ">> Rewriting protected-exports recipe in $MOD_MK"
-            grep -n "gki_module_protected_exports" "$MOD_MK" || true
-            python3 - "$MOD_MK" <<'PYEOF'
-            import sys
-            p = sys.argv[1]
-            lines = open(p, encoding="utf-8", errors="ignore").read().splitlines(keepends=True)
-            out = []
-            i = 0
-            target = "gki_module_protected_exports.h"
-            while i < len(lines):
-                line = lines[i]
-                if target in line and ":" in line and not line.lstrip().startswith("#"):
-                    rule_target = line.split(":")[0].rstrip()
-                    out.append(f"{rule_target}: FORCE\n")
-                    out.append("\t$(Q)mkdir -p $(dir $@)\n")
-                    out.append("\t$(Q): > $@\n")
-                    i += 1
-                    while i < len(lines) and (lines[i].startswith("\t") or lines[i].strip() == ""):
-                        if lines[i].strip() == "":
-                            j = i + 1
-                            while j < len(lines) and lines[j].strip() == "":
-                                j += 1
-                            if j < len(lines) and lines[j].startswith("\t"):
-                                i += 1
-                                continue
-                            else:
-                                break
-                        i += 1
-                    continue
-                out.append(line)
-                i += 1
-            open(p, "w", encoding="utf-8").write("".join(out))
-            print(">> Patched recipe for", target)
-            PYEOF
-          fi
+          # Backstop configuration target protection map lists
+          pe_file = "android/abi_gki_protected_exports_aarch64"
+          os.makedirs(os.path.dirname(pe_file), exist_ok=True)
+          if not os.path.exists(pe_file):
+              with open(pe_file, "w", encoding="utf-8") as f:
+                  pass
 
-          if [ -f "$GEN_SCRIPT" ]; then
-            echo ">> Neutralizing $GEN_SCRIPT to emit empty header."
-            cat > "$GEN_SCRIPT" <<'SHEOF'
-            #!/bin/bash
-            # Neutralized for SUSFS: emit an empty protected-exports header.
-            out="${@: -1}"
-            if [ -z "$out" ] || [ "$out" = "$0" ]; then
-              exit 0
-            fi
-            mkdir -p "$(dirname "$out")"
-            : > "$out"
-            exit 0
-            SHEOF
-            chmod +x "$GEN_SCRIPT"
-          fi
+          # Rewrite build routine recipe logic structures safely
+          mod_mk = "kernel/module/Makefile"
+          if os.path.exists(mod_mk):
+              print(f">> Rewriting protected-exports recipe inside: {mod_mk}")
+              lines = open(mod_mk, encoding="utf-8", errors="ignore").read().splitlines(keepends=True)
+              out = []
+              i = 0
+              target = "gki_module_protected_exports.h"
+              while i < len(lines):
+                  line = lines[i]
+                  if target in line and ":" in line and not line.lstrip().startswith("#"):
+                      rule_target = line.split(":")[0].rstrip()
+                      out.append(f"{rule_target}: FORCE\n")
+                      out.append("\t$(Q)mkdir -p $(dir $@)\n")
+                      out.append("\t$(Q): > $@\n")
+                      i += 1
+                      while i < len(lines) and (lines[i].startswith("\t") or lines[i].strip() == ""):
+                          if lines[i].strip() == "":
+                              j = i + 1
+                              while j < len(lines) and lines[j].strip() == "":
+                                  j += 1
+                              if j < len(lines) and lines[j].startswith("\t"):
+                                  i += 1
+                                  continue
+                              else:
+                                  break
+                          i += 1
+                      continue
+                  out.append(line)
+                  i += 1
+              with open(mod_mk, "w", encoding="utf-8") as f:
+                  f.write("".join(out))
 
-          for BZL in BUILD.bazel modules.bzl; do
-            if [ -f "$BZL" ] && grep -q "abi_gki_protected_exports" "$BZL"; then
-              echo ">> Cleaning protected_exports refs in: $BZL"
-              sed -i '/abi_gki_protected_exports/d' "$BZL" || true
-            fi
-          done
+          # Override generating tools binary wrapper execution targets
+          gen_script = "scripts/gen_gki_modules_headers.sh"
+          if os.path.exists(gen_script):
+              print(f">> Neutralizing {gen_script} payload logic chains.")
+              script_content = (
+                  "#!/bin/bash\n"
+                  "# Neutralized for SUSFS: emit an empty protected-exports header.\n"
+                  'out="${@: -1}"\n'
+                  'if [ -z "$out" ] || [ "$out" = "$0" ]; then\n'
+                  "  exit 0\n"
+                  "fi\n"
+                  'mkdir -p "$(dirname "$out")"\n'
+                  ': > "$out"\n'
+                  "exit 0\n"
+              )
+              with open(gen_script, "w", encoding="utf-8") as f:
+                  f.write(script_content)
+              os.chmod(gen_script, 0o755)
 
+          # Eliminate references throughout active bazel packages
+          for bzl_file in ["BUILD.bazel", "modules.bzl"]:
+              if os.path.exists(bzl_file):
+                  lines = open(bzl_file, encoding="utf-8", errors="ignore").read().splitlines()
+                  cleaned_lines = [l for l in lines if "abi_gki_protected_exports" not in l]
+                  with open(bzl_file, "w", encoding="utf-8") as f:
+                      f.write("\n".join(cleaned_lines) + "\n")
+                  print(f">> Purged protected references out of: {bzl_file}")
+
+      - name: 7. Configure Kernel Defconfigs and Drivers
+        working-directory: workspace/msm-kernel
+        run: |
           echo "=================================================="
           echo ">> STAGE 8: Wire up KSU Kconfig + neutralize fingerprint"
           echo "=================================================="
@@ -264,7 +268,7 @@ jobs:
               echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> "$1"
             ' _ {} \;
 
-      - name: 6. Prepare Qualcomm Build Package Extensions
+      - name: 8. Prepare Qualcomm Build Package Extensions
         working-directory: workspace
         run: |
           mkdir -p build
@@ -285,7 +289,7 @@ jobs:
             echo "def define_combined_vm_image(*args, **kwargs): pass" >> build/msm_kernel_extensions.bzl
           fi
 
-      - name: 7. Sanitize Obsolete Parameters & Mock OEM Layers
+      - name: 9. Sanitize Obsolete Parameters & Mock OEM Layers
         working-directory: workspace
         shell: python
         run: |
@@ -388,13 +392,13 @@ jobs:
               for sym, val in symbols.items():
                   f.write(f"{sym} = {val}\n")
 
-      - name: 8. Compile the Kernel via Qualcomm Kleaf
+      - name: 10. Compile the Kernel via Qualcomm Kleaf
         working-directory: workspace
         run: |
           echo ">> Commencing Kernel Compilation via Qualcomm Bazel..."
           tools/bazel run //msm-kernel:kernel_aarch64_dist -- --dist_dir=out_dist
 
-      - name: 9. Upload Boot Image
+      - name: 11. Upload Boot Image
         uses: actions/upload-artifact@v4
         with:
           name: boot-img-nos4.1-susfs
