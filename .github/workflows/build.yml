@@ -86,7 +86,6 @@ jobs:
           
           if ! grep -q "susfs.o" fs/Makefile; then
             echo "obj-y += susfs.o" >> fs/Makefile
-            # Suppress unused function warnings inside susfs to satisfy strict compilation flags
             echo "CFLAGS_susfs.o += -Wno-unused-variable -Wno-unused-function -Wno-error" >> fs/Makefile
           fi
 
@@ -99,10 +98,10 @@ jobs:
           echo ">> Patching KernelSU-Next for SUSFS..."
           if [ -d drivers/kernelsu ]; then
             cd drivers/kernelsu
-            # Explicitly search for the ksunext patch variants inside the tree
-            PATCH_FILE=$(find /tmp/susfs4ksu/ksu_patches/ -type f -name "*ksunext*.patch" | head -n 1)
+            # Target the specific KernelSU submodule integration patch structure from the cloned repository
+            PATCH_FILE=$(find /tmp/susfs4ksu/kernel_patches/KernelSU/ -type f -name "10_enable_susfs_for_ksu.patch" | head -n 1)
             if [ -z "$PATCH_FILE" ]; then
-              PATCH_FILE=$(find /tmp/susfs4ksu/ksu_patches/ -type f -name "*6.6*.patch" | head -n 1)
+              PATCH_FILE=$(find /tmp/susfs4ksu/kernel_patches/ -type f -name "*ksu*.patch" | head -n 1)
             fi
             
             if [ -n "$PATCH_FILE" ]; then
