@@ -206,56 +206,65 @@ jobs:
           echo "===== grep gki_module ====="
           grep -n "gki_module" kernel/module/Makefile || true
 
-      - name: 8. Protected-Exports Neutralization (emit valid zero-symbol header)
+      - name: 8. Protected-Exports Neutralization (POSIX-clean zero-symbol header)
         working-directory: workspace/msm-kernel
         shell: python
         run: |
           import os
 
-          print(">> STAGE 6: Neutralize protected-export ENFORCEMENT (zero-symbol header)")
+          print(">> STAGE 6: Neutralize protected-export ENFORCEMENT (POSIX-clean)")
 
           pe_file = "android/abi_gki_protected_exports_aarch64"
           os.makedirs(os.path.dirname(pe_file), exist_ok=True)
           if not os.path.exists(pe_file):
               open(pe_file, "w", encoding="utf-8").close()
 
+          # The Makefile runs this script via $(CONFIG_SHELL), which is dash on the
+          # runner -- NOT bash. The previous version used nested heredocs inside an
+          # if/else block, which dash cannot parse (syntax error: unexpected EOF).
+          # This version is strictly POSIX: no heredocs, no bashisms. It emits each
+          # header line with printf and selects the variant with a case statement.
           gen_script = "scripts/gen_gki_modules_headers.sh"
           if os.path.exists(gen_script):
-              print(">> Neutralizing %s to emit a valid zero-symbol header." % gen_script)
-              content = r'''#!/bin/bash
-              # Neutralized for SukiSU/SUSFS: emit a STRUCTURALLY VALID header with 0 symbols.
-              # Arg 1 = output header path (per kernel/module/Makefile).
-              out="$1"
-              if [ -z "$out" ]; then
-                exit 0
-              fi
-              mkdir -p "$(dirname "$out")"
-              base="$(basename "$out")"
-              
-              if [ "$base" = "gki_module_unprotected.h" ]; then
-                cat > "$out" <<'EOF'
-              #ifndef _GKI_MODULE_UNPROTECTED_H
-              #define _GKI_MODULE_UNPROTECTED_H
-              #define NR_UNPROTECTED_SYMBOLS 0
-              #define MAX_UNPROTECTED_NAME_LEN 1
-              static const char gki_unprotected_symbols[NR_UNPROTECTED_SYMBOLS][MAX_UNPROTECTED_NAME_LEN] = {};
-              #endif
-              EOF
-              else
-                cat > "$out" <<'EOF'
-              #ifndef _GKI_MODULE_PROTECTED_EXPORTS_H
-              #define _GKI_MODULE_PROTECTED_EXPORTS_H
-              #define NR_PROTECTED_EXPORTS_SYMBOLS 0
-              #define MAX_PROTECTED_EXPORTS_NAME_LEN 1
-              static const char gki_protected_exports_symbols[NR_PROTECTED_EXPORTS_SYMBOLS][MAX_PROTECTED_EXPORTS_NAME_LEN] = {};
-              #endif
-              EOF
-              fi
-              exit 0
-              '''
+              print(">> Neutralizing %s (POSIX-clean, dash-safe)." % gen_script)
+              content = (
+                  "#!/bin/sh\n"
+                  "# Neutralized for SukiSU/SUSFS: emit a STRUCTURALLY VALID header\n"
+                  "# with zero symbols. POSIX sh only (invoked via CONFIG_SHELL=dash).\n"
+                  "out=\"$1\"\n"
+                  "if [ -z \"$out\" ]; then\n"
+                  "    exit 0\n"
+                  "fi\n"
+                  "dir=$(dirname \"$out\")\n"
+                  "mkdir -p \"$dir\"\n"
+                  "base=$(basename \"$out\")\n"
+                  ": > \"$out\"\n"
+                  "case \"$base\" in\n"
+                  "    gki_module_unprotected.h)\n"
+                  "        printf '%s\\n' '#ifndef _GKI_MODULE_UNPROTECTED_H' >> \"$out\"\n"
+                  "        printf '%s\\n' '#define _GKI_MODULE_UNPROTECTED_H' >> \"$out\"\n"
+                  "        printf '%s\\n' '#define NR_UNPROTECTED_SYMBOLS 0' >> \"$out\"\n"
+                  "        printf '%s\\n' '#define MAX_UNPROTECTED_NAME_LEN 1' >> \"$out\"\n"
+                  "        printf '%s\\n' 'static const char gki_unprotected_symbols[NR_UNPROTECTED_SYMBOLS][MAX_UNPROTECTED_NAME_LEN] = {};' >> \"$out\"\n"
+                  "        printf '%s\\n' '#endif' >> \"$out\"\n"
+                  "        ;;\n"
+                  "    *)\n"
+                  "        printf '%s\\n' '#ifndef _GKI_MODULE_PROTECTED_EXPORTS_H' >> \"$out\"\n"
+                  "        printf '%s\\n' '#define _GKI_MODULE_PROTECTED_EXPORTS_H' >> \"$out\"\n"
+                  "        printf '%s\\n' '#define NR_PROTECTED_EXPORTS_SYMBOLS 0' >> \"$out\"\n"
+                  "        printf '%s\\n' '#define MAX_PROTECTED_EXPORTS_NAME_LEN 1' >> \"$out\"\n"
+                  "        printf '%s\\n' 'static const char gki_protected_exports_symbols[NR_PROTECTED_EXPORTS_SYMBOLS][MAX_PROTECTED_EXPORTS_NAME_LEN] = {};' >> \"$out\"\n"
+                  "        printf '%s\\n' '#endif' >> \"$out\"\n"
+                  "        ;;\n"
+                  "esac\n"
+                  "exit 0\n"
+              )
               with open(gen_script, "w", encoding="utf-8") as f:
                   f.write(content)
               os.chmod(gen_script, 0o755)
+              # Sanity: confirm parens/fi balance by dumping for the log.
+              print(">> --- emitted gen_gki_modules_headers.sh ---")
+              print(content)
           else:
               print(">> [WARN] %s not found; header generation untouched." % gen_script)
 
