@@ -69,20 +69,19 @@ jobs:
           ref: sm8735/b/mr
           path: workspace/msm-kernel
 
-      - name: 5. Integrate KSU-Next (pershoot next-susfs) + SUSFS VFS @ 2df41de
+      - name: 5. Integrate KSU-Next (pershoot next-susfs, FORCED) + SUSFS VFS @ 2df41de
         working-directory: workspace/msm-kernel
         run: |
           set -e
 
-          # VERIFIED PAIRING (WildKernels android15-6.6 release):
-          #   Driver: pershoot/KernelSU-Next `next-susfs` branch. Its setup.sh
-          #           HARDCODES BRANCH="next-susfs" and defaults to MANUAL HOOKS.
-          #           Bare invocation checks out the latest next-susfs TAG.
-          #           This driver DEFINES the bridge symbols (susfs_is_current_ksu_domain
-          #           etc.) that earlier rifsxd-`next`/Wild-KSU drivers did NOT.
-          #   SUSFS:  susfs4ksu gki-android15-6.6 @ 2df41de (the commit WildKernels
-          #           pairs with this driver) — SUSFS v2.x.
-          #   Manual hooks => MUST also apply 60_scope-minimized_manual_hooks.patch.
+          # ROOT-CAUSE FIX: prior builds kept symlinking the WRONG (rifsxd) driver
+          # because pershoot's setup.sh only clones if KernelSU-Next/ is ABSENT
+          # (`test -d ... || git clone`). Something pre-populated that path, so the
+          # clone was skipped and the rifsxd driver (which does NOT define
+          # susfs_is_current_ksu_domain) got symlinked — hence the recurring
+          # undefined-symbol link error. We now: (1) WIPE any stale KSU dirs/symlink,
+          # (2) EXPLICITLY clone pershoot/KernelSU-Next next-susfs, (3) MANUALLY
+          # symlink it ourselves — bypassing the conditional entirely.
           SUSFS_PIN="2df41de789026a6422521606402576507c687435"
 
           fail_on_rej() {
@@ -98,12 +97,38 @@ jobs:
             fi
           }
 
-          echo ">> STAGE 1: Clone susfs4ksu @ $SUSFS_PIN (VFS layer source)"
+          echo ">> STAGE 0: Wipe any pre-existing KernelSU / KernelSU-Next state"
+          rm -rf KernelSU-Next KernelSU
+          [ -L drivers/kernelsu ] && rm -f drivers/kernelsu || true
+          [ -d drivers/kernelsu ] && rm -rf drivers/kernelsu || true
+          # Strip any stale Makefile/Kconfig wiring so we re-add cleanly.
+          sed -i '/kernelsu/d' drivers/Makefile 2>/dev/null || true
+          sed -i '\#drivers/kernelsu/Kconfig#d' drivers/Kconfig 2>/dev/null || true
+
+          echo ">> STAGE 1: EXPLICITLY clone pershoot/KernelSU-Next (next-susfs)"
+          git clone --depth=1 -b next-susfs https://github.com/pershoot/KernelSU-Next KernelSU-Next
+          echo ">> Cloned pershoot next-susfs @ $(cd KernelSU-Next && git rev-parse --short HEAD)"
+          # Sanity: confirm we actually have pershoot's susfs-aware driver, which
+          # must reference the bridge symbol somewhere in its kernel/ sources.
+          if ! grep -rq "susfs_is_current_ksu_domain" KernelSU-Next/kernel/ 2>/dev/null; then
+            echo ">> [FATAL] Cloned KernelSU-Next does NOT contain susfs_is_current_ksu_domain."
+            echo ">> This is not the next-susfs (susfs-aware) driver. Aborting."
+            exit 1
+          fi
+          echo ">> Confirmed: pershoot next-susfs driver defines the SUSFS bridge."
+
+          echo ">> STAGE 2: Manually symlink the driver into drivers/kernelsu"
+          ln -sf "$(realpath --relative-to=drivers KernelSU-Next/kernel)" drivers/kernelsu
+          grep -q "kernelsu" drivers/Makefile || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+          grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig || sed -i '/endmenu/i\source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+          echo ">> Driver symlinked: $(readlink -f drivers/kernelsu)"
+
+          echo ">> STAGE 3: Clone susfs4ksu @ $SUSFS_PIN (VFS layer source)"
           git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 /tmp/susfs4ksu
           ( cd /tmp/susfs4ksu && git checkout "$SUSFS_PIN" )
           echo ">> susfs4ksu pinned to $(cd /tmp/susfs4ksu && git rev-parse --short HEAD)"
 
-          echo ">> STAGE 2: Copy SUSFS VFS sources + headers into tree"
+          echo ">> STAGE 4: Copy SUSFS VFS sources + headers into tree"
           cp -v /tmp/susfs4ksu/kernel_patches/fs/* fs/
           cp -v /tmp/susfs4ksu/kernel_patches/include/linux/* include/linux/
 
@@ -112,7 +137,7 @@ jobs:
             echo "CFLAGS_susfs.o += -Wno-unused-variable -Wno-unused-function -Wno-error" >> fs/Makefile
           fi
 
-          echo ">> STAGE 3: Apply SUSFS VFS patch (50_add_susfs)"
+          echo ">> STAGE 5: Apply SUSFS VFS patch (50_add_susfs)"
           GKI_PATCH=$(find /tmp/susfs4ksu -type f -name "50_add_susfs_in_gki-android15-6.6.patch" | head -n 1)
           [ -z "$GKI_PATCH" ] && GKI_PATCH=$(find /tmp/susfs4ksu -type f -name "*.patch" | grep -iE "gki.*6\.6" | head -n 1)
           if [ -z "$GKI_PATCH" ]; then
@@ -122,7 +147,7 @@ jobs:
           patch -p1 --fuzz=3 < "$GKI_PATCH" || true
           fail_on_rej
 
-          echo ">> STAGE 4: Apply manual-hooks patch (driver defaults to manual hooks)"
+          echo ">> STAGE 6: Apply manual-hooks patch (driver defaults to manual hooks)"
           HOOK_PATCH=$(find /tmp/susfs4ksu -type f -name "*scope-minimized_manual_hooks*.patch" | head -n 1)
           if [ -n "$HOOK_PATCH" ]; then
             echo ">> Applying manual-hook patch: $HOOK_PATCH"
@@ -130,77 +155,42 @@ jobs:
             fail_on_rej
           else
             echo ">> [WARN] No scope-minimized_manual_hooks patch found in susfs4ksu."
-            echo ">> The next-susfs driver defaults to manual hooks; without this patch"
-            echo ">> the kernel-side hook points may be absent. Continuing, but watch the build."
           fi
 
-          echo ">> STAGE 5: Integrate pershoot KernelSU-Next (next-susfs, manual hooks)"
-          # Bare invocation: setup.sh hardcodes BRANCH=next-susfs and checks out the
-          # latest tag; NO second arg => manual hooks (matches the patch above).
-          curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/refs/heads/next-susfs/kernel/setup.sh" | bash
-
-          if [ ! -d drivers/kernelsu ] && [ ! -L drivers/kernelsu ] && [ ! -d KernelSU-Next ]; then
-            echo ">> [FATAL] KernelSU-Next (next-susfs) setup did not install the driver." && exit 1
-          fi
-          echo ">> next-susfs driver present."
-
-          echo ">> STAGE 6: Wire Kconfig + neutralize fingerprint modpost stub"
-          if [ -d drivers/kernelsu ] && ! grep -q "kernelsu" drivers/Kconfig; then
-            sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
-          fi
+          echo ">> STAGE 7: Neutralize fingerprint modpost stub"
           if [ -d drivers/input/fingerprint ]; then
             echo "obj-y =" > drivers/input/fingerprint/Makefile
           fi
 
-      - name: 6. Reconcile try_umount Signature (defensive net)
+      - name: 6. ASSERT bridge symbol is defined in-tree BEFORE the long build
         working-directory: workspace/msm-kernel
-        shell: python
         run: |
-          import os
-          import re
-          import sys
+          set -e
+          echo ">> Pre-build assertion: susfs_is_current_ksu_domain must be DEFINED"
 
-          print(">> Reconcile try_umount signature (defensive net)")
+          # fs/susfs.c REFERENCES it; the KSU driver must DEFINE it. Search the
+          # driver sources for a definition (function body), not just a call.
+          DRIVER_SRC=$(find KernelSU-Next/kernel drivers/kernelsu -name "*.c" 2>/dev/null | sort -u)
 
-          ksu_root = ""
-          if os.path.islink("drivers/kernelsu"):
-              ksu_root = os.path.dirname(os.path.realpath("drivers/kernelsu"))
-          elif os.path.isdir("KernelSU-Next"):
-              ksu_root = "KernelSU-Next"
-          else:
-              for item in os.listdir("."):
-                  if os.path.isdir(item) and item.lower().startswith("kernelsu"):
-                      ksu_root = item
-                      break
+          if [ -z "$DRIVER_SRC" ]; then
+            echo ">> [FATAL] No KSU driver .c files found — driver not installed."; exit 1
+          fi
 
-          if not ksu_root:
-              print(">> KSU root not found; skipping reconciliation.")
-              sys.exit(0)
-
-          targets = []
-          for root, dirs, files in os.walk(ksu_root):
-              for fn in files:
-                  if fn.endswith(".c"):
-                      targets.append(os.path.join(root, fn))
-
-          reconciled_total = 0
-          for ch_path in targets:
-              src = open(ch_path, encoding="utf-8", errors="ignore").read()
-              four_arg_def = re.search(r'void\s+try_umount\s*\([^)]*\buid_t\s+\w+\s*\)', src)
-              if not four_arg_def:
-                  continue
-              pattern = re.compile(r'(try_umount\s*\(\s*[^,()]+,\s*(?:true|false)\s*,\s*[A-Za-z0-9_]+)\s*\)')
-              fixed, n = pattern.subn(r'\1, 0)', src)
-              if n:
-                  with open(ch_path, "w", encoding="utf-8") as f:
-                      f.write(fixed)
-                  reconciled_total += n
-                  print(">> Reconciled %d call(s) in %s" % (n, ch_path))
-
-          if reconciled_total == 0:
-              print(">> No 4-arg def with mismatched call sites found; nothing to reconcile.")
-          else:
-              print(">> Total reconciled: %d" % reconciled_total)
+          # A definition looks like: <type> susfs_is_current_ksu_domain(...) {
+          # We accept any .c line that has the name followed by '(' and is not
+          # a bare prototype ending in ';' on the same line.
+          if grep -rEn "susfs_is_current_ksu_domain\s*\(" $DRIVER_SRC | grep -vE ";\s*$" >/dev/null; then
+            echo ">> OK: susfs_is_current_ksu_domain is defined in the driver."
+          else
+            echo ">> [FATAL] susfs_is_current_ksu_domain is NOT defined in the driver sources."
+            echo ">> The driver references/declares but does not define it — likely a"
+            echo ">> hook-mode coupling (defined only under kprobes) or a driver/susfs"
+            echo ">> version drift. Dumping every occurrence for diagnosis:"
+            grep -rEn "susfs_is_current_ksu_domain" $DRIVER_SRC || true
+            echo ">> Also checking fs/susfs.c reference site:"
+            grep -nE "susfs_is_current_ksu_domain" fs/susfs.c || true
+            exit 1
+          fi
 
       - name: 7. Debug - dump module Makefile (ground truth)
         working-directory: workspace/msm-kernel
