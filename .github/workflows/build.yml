@@ -2,9 +2,6 @@ name: Build Nothing OS 4.1 Kernel (SUSFS)
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
 
 permissions:
   contents: read
@@ -77,8 +74,9 @@ jobs:
       - name: 5. Inject KernelSU-Next & SUSFS
         working-directory: workspace/msm-kernel
         run: |
-          echo ">> Downloading KernelSU-Next..."
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
+          echo ">> Downloading Pre-patched KernelSU-Next for SUSFS..."
+          # Pulls the specialized development branch containing pre-integrated integration tracks
+          curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/refs/heads/dev-susfs/kernel/setup.sh" | bash -s dev-susfs
 
           echo ">> Downloading SUSFS Patches..."
           git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 /tmp/susfs4ksu
@@ -96,32 +94,6 @@ jobs:
           SUSFS_KERNEL_PATCH=$(find /tmp/susfs4ksu/kernel_patches/ -name "*50_add_susfs_in_gki*.patch" | head -n 1)
           if [ -n "$SUSFS_KERNEL_PATCH" ]; then
             patch -p1 < "$SUSFS_KERNEL_PATCH"
-          fi
-
-          echo ">> Patching KernelSU-Next for SUSFS..."
-          KSU_ROOT_DIR=""
-          if [ -d KernelSU-Next ]; then
-            KSU_ROOT_DIR="KernelSU-Next"
-          elif [ -d KernelSU ]; then
-            KSU_ROOT_DIR="KernelSU"
-          fi
-
-          if [ -n "$KSU_ROOT_DIR" ]; then
-            cd "$KSU_ROOT_DIR"
-            PATCH_FILE=$(find /tmp/susfs4ksu/kernel_patches/KernelSU/ -type f -name "10_enable_susfs_for_ksu.patch" | head -n 1)
-            if [ -z "$PATCH_FILE" ]; then
-              PATCH_FILE=$(find /tmp/susfs4ksu/kernel_patches/ -type f -name "*ksu*.patch" | head -n 1)
-            fi
-            
-            if [ -n "$PATCH_FILE" ]; then
-              echo ">> Applying target KSU patch from root: $PATCH_FILE"
-              patch -p1 < "$PATCH_FILE"
-            else
-              echo ">> [FATAL] KernelSU patch file could not be resolved!" && exit 1
-            fi
-            cd ..
-          else
-            echo ">> [FATAL] KernelSU repository directory structure could not be identified!" && exit 1
           fi
 
           if [ -d drivers/kernelsu ] && ! grep -q "kernelsu" drivers/Kconfig; then
