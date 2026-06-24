@@ -106,6 +106,19 @@ jobs:
           cd ..
           [ -d KernelSU-Next/kernel ] || { echo ">> [FATAL] KernelSU-Next has no kernel/ dir"; exit 1; }
 
+          echo ">> STAGE 1b: Stamp real KSU version (Bazel sandbox strips .git -> would fall back to 1)"
+          KB="KernelSU-Next/kernel/Kbuild"
+          KSU_COUNT=$(git -C KernelSU-Next rev-list --count HEAD 2>/dev/null || echo 0)
+          KSU_TAG=$(git -C KernelSU-Next describe --tags --abbrev=0 2>/dev/null || echo "v3.2.0")
+          KSU_VERSION_NUM=$(expr 30000 + "$KSU_COUNT")
+          echo ">> rev-count=${KSU_COUNT}  tag=${KSU_TAG}  ->  KSU_VERSION=${KSU_VERSION_NUM}"
+          [ "$KSU_VERSION_NUM" -ge 33110 ] || { echo ">> [FATAL] computed KSU_VERSION ${KSU_VERSION_NUM} < 33110 (manager floor). Likely a shallow clone — aborting."; exit 1; }
+          sed -i "1i KSU_GIT_VERSION := ${KSU_COUNT}\nKSU_GIT_TAG := ${KSU_TAG}\nKSU_GIT_VERSION_VALID := 1" "$KB"
+          echo ">> Kbuild version lines AFTER injection:"
+          grep -nE 'KSU_GIT_VERSION_VALID|KSU_GIT_VERSION :=|KSU_GIT_TAG :=' "$KB" | sed 's/^/     /'
+
+          echo ">> STAGE 2: Symlink driver into drivers/kernelsu"
+          # ... your existing STAGE 2 continues unchanged
           echo ">> STAGE 2: Symlink driver into drivers/kernelsu"
           ln -sf "$(realpath --relative-to=drivers KernelSU-Next/kernel)" drivers/kernelsu
           grep -q "kernelsu" drivers/Makefile || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
